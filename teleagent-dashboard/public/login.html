@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#f3f6fb">
+<title>登录 · TeleAgent 多账号控制台</title>
+<script>
+try { document.documentElement.dataset.theme = localStorage.getItem('ta-theme') === 'dark' ? 'dark' : 'light'; } catch (e) {}
+</script>
+<style>
+:root{--bg:#070a12;--panel:#0d1424;--line:#1c2740;--line2:#25334f;
+  --txt:#e9eefb;--sub:#8598b8;--dim:#5a6b88;--ok:#3ddc97;--err:#ff6b6b;--blue:#4d8dff;--cyan:#38d6e8;
+  --input:#0d1526;--soft:rgba(255,255,255,.04);--soft2:rgba(255,255,255,.08);
+  --glow1:rgba(77,141,255,.16);--glow2:rgba(56,214,232,.09);
+  --boxshadow:0 26px 70px rgba(0,0,0,.55);
+  --logofg:#bcd4ff;--errfg:#ffb0b0}
+html[data-theme="light"]{--bg:#f3f6fb;--panel:#fff;--line:#e1e7f1;--line2:#cbd6e6;
+  --txt:#1a2233;--sub:#57677f;--dim:#8394ab;--ok:#12a870;--err:#d13b3b;--blue:#2c62d4;--cyan:#0d93a6;
+  --input:#f7f9fd;--soft:rgba(15,23,42,.035);--soft2:rgba(15,23,42,.07);
+  --glow1:rgba(77,141,255,.12);--glow2:rgba(56,214,232,.1);
+  --boxshadow:0 20px 50px rgba(23,42,80,.12);
+  --logofg:#2c5fbd;--errfg:#a82c2c}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--txt);
+  font:14px/1.6 -apple-system,"SF Pro SC","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+  -webkit-font-smoothing:antialiased;min-height:100vh;display:grid;place-items:center;padding:20px;
+  background-image:radial-gradient(1000px 520px at 72% -14%,var(--glow1),transparent 70%),
+    radial-gradient(800px 460px at -10% 110%,var(--glow2),transparent 70%)}
+.box{width:min(352px,100%);background:var(--panel);border:1px solid var(--line);border-radius:16px;
+  padding:26px 24px;box-shadow:var(--boxshadow)}
+.brand{display:flex;align-items:center;gap:11px;margin-bottom:4px}
+.logo{width:36px;height:36px;border-radius:10px;display:grid;place-items:center;font-size:17px;
+  background:linear-gradient(145deg,rgba(77,141,255,.28),rgba(56,214,232,.14));
+  border:1px solid rgba(77,141,255,.35);color:var(--logofg)}
+.brand h1{font-size:15.5px;font-weight:650;line-height:1.25}
+.brand div span{font-size:11px;color:var(--dim)}
+.tag{color:var(--dim);font-size:12px;margin:14px 0 2px}
+label{display:block;color:var(--sub);font-size:12px;margin:11px 0 5px}
+input{width:100%;background:var(--input);border:1px solid var(--line);color:var(--txt);
+  border-radius:9px;padding:9px 12px;font-size:14px;outline:none;transition:border-color .15s}
+input:focus{border-color:var(--blue)}
+button{width:100%;margin-top:18px;background:linear-gradient(145deg,#3b7bf0,#2c62d4);
+  border:1px solid #5d95ff;color:#fff;border-radius:9px;padding:10px 0;font-size:14px;
+  font-weight:600;cursor:pointer;transition:filter .15s}
+button:hover{filter:brightness(1.12)}
+button:disabled{opacity:.55;cursor:wait}
+.err{display:none;margin-top:12px;background:rgba(255,107,107,.12);border:1px solid rgba(255,107,107,.32);
+  color:var(--errfg);border-radius:9px;padding:8px 12px;font-size:12.5px}
+.shake{animation:shake .34s}
+@keyframes shake{0%,100%{transform:translateX(0)}25%{transform:translateX(-6px)}75%{transform:translateX(6px)}}
+.foot{margin-top:16px;color:var(--dim);font-size:11px;text-align:center;line-height:1.8;
+  border-top:1px dashed var(--line);padding-top:13px}
+.foot b{color:var(--cyan);font-weight:600}
+.themebtn{position:fixed;top:16px;right:16px;width:34px;height:34px;padding:0;margin:0;
+  border-radius:10px;border:1px solid var(--line2);background:var(--soft);color:var(--sub);
+  font:15px/1 inherit;display:grid;place-items:center;cursor:pointer;transition:.15s}
+.themebtn:hover{color:var(--txt);background:var(--soft2)}
+</style>
+</head>
+<body>
+<button class="themebtn" id="themebtn" title="切换主题">☀</button>
+<div class="box" id="box">
+  <div class="brand">
+    <div class="logo">◈</div>
+    <div><h1>TeleAgent 控制台</h1><span>多账号保活 · 积分 · 电源</span></div>
+  </div>
+  <div class="tag">面板访问凭据</div>
+  <form id="f" autocomplete="on">
+    <label for="u">用户名</label>
+    <input id="u" name="u" autocomplete="username" required>
+    <label for="p">密码</label>
+    <input id="p" type="password" name="p" autocomplete="current-password" required>
+    <button type="submit" id="go">登 录</button>
+    <div class="err" id="err"></div>
+  </form>
+  <div class="foot">登录会话 7 天有效 · 此面板可托管多个平台账号</div>
+</div>
+<script>
+const f = document.getElementById('f'), err = document.getElementById('err'), go = document.getElementById('go');
+f.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  err.style.display = 'none'; go.disabled = true; go.textContent = '验证中…';
+  try {
+    const r = await fetch('/api/panel/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ user: document.getElementById('u').value.trim(), password: document.getElementById('p').value })
+    });
+    const j = await r.json().catch(() => ({}));
+    if (r.ok && j.ok !== false) { location.href = '/'; return; }
+    throw new Error(j.error || '用户名或密码不正确');
+  } catch (e2) {
+    err.textContent = e2.message; err.style.display = 'block';
+    document.getElementById('box').classList.add('shake');
+    setTimeout(() => document.getElementById('box').classList.remove('shake'), 400);
+    go.disabled = false; go.textContent = '登 录';
+  }
+});
+
+/* 主题切换 */
+function applyTheme(t) {
+  const light = t === 'light';
+  document.documentElement.dataset.theme = light ? 'light' : 'dark';
+  try { localStorage.setItem('ta-theme', light ? 'light' : 'dark'); } catch {}
+  document.getElementById('themebtn').textContent = light ? '☾' : '☀';
+  document.getElementById('themebtn').title = light ? '切换到暗色主题' : '切换到亮色主题';
+  const m = document.querySelector('meta[name="theme-color"]');
+  if (m) m.content = light ? '#f3f6fb' : '#070a12';
+}
+applyTheme(document.documentElement.dataset.theme);
+document.getElementById('themebtn').onclick = () =>
+  applyTheme(document.documentElement.dataset.theme === 'light' ? 'dark' : 'light');
+</script>
+</body>
+</html>

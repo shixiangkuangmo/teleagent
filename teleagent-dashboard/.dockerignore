@@ -1,0 +1,9 @@
+node_modules
+data
+npm-debug.log*
+*.log
+.git
+.gitignore
+.env
+.env.*
+start-dashboard.ps1

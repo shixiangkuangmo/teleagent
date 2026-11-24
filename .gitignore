@@ -1,0 +1,38 @@
+# ---- 凭据与运行时数据（绝不提交）----
+data/
+**/data/
+.env
+**/.env
+*.secret
+**/.secret
+jwt.txt
+**/jwt.txt
+data/accounts/
+pool-agent.json
+**/pool-agent.json
+token.txt
+
+# ---- 旧副本与内部资料 ----
+teleagent-dashboardold/
+.trae/
+/*.png
+
+# ---- 依赖与构建产物 ----
+node_modules/
+**/node_modules/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.spec
+build/
+dist/
+TeleAgent-OpenAI/python/
+*.exe
+*.zip
+*.log
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

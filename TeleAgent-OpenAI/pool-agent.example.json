@@ -1,0 +1,10 @@
+{
+  "server": "wss://panel.example.com/api/pool/agent",
+  "node_id": "n_xxxxxxxxxxxx",
+  "token": "sk-node-xxxxxxxxxxxxxxxxxxxxxxxx",
+  "gateway_url": "http://127.0.0.1:8899",
+  "gateway_key": "",
+  "name": "办公机-01",
+  "max_inflight": 4,
+  "insecure": false
+}

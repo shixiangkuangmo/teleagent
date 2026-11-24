@@ -1,0 +1,10 @@
+# Runtime data (JWT credentials, logs, state) - NEVER commit
+data/
+# Dependencies
+node_modules/
+# Local debug artifacts
+.start.err
+.t2.log
+*.log
+# Environment
+.env

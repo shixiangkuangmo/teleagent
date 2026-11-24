@@ -1,0 +1,936 @@
+"""
+TeleAgent OpenAI 兼容网关 v2
+============================
+把本机 TeleAgent（4397 opencode server）包装成标准 OpenAI 接口。
+
+v2 相对 v1 的关键修复
+---------------------
+1. **真流式**：订阅 4397 的 /event (SSE)，把 message.part.delta 实时转发给客户端。
+   v1 是「等上游完整回复再切块」，大请求（10万+ token）期间客户端零字节可收，
+   会被判超时断连（WinError 10053）——这就是「卡死」的根因。
+2. **首字节探活**：流式连接建立后立刻发 role chunk，客户端立即收到响应头，不再干等。
+3. **心跳保活**：等待上游期间每 3 秒发一个 SSE 注释行 `: keepalive`，防中间层超时。
+4. **请求日志**：记录每个请求的耗时/token/状态，便于排查卡顿。
+5. **key 提取不阻塞**：key 失效时后台重提，期间请求排队而不是全部卡在锁上。
+
+启动：
+    python teleagent_gateway.py                # 默认 127.0.0.1:8899
+    python teleagent_gateway.py --port 9000
+
+接口：
+    GET  /v1/models              列出模型
+    POST /v1/chat/completions    OpenAI 格式（流式；tools/response_format 走提示词桥接）
+    可选：TG_API_KEY 开启 Bearer 鉴权，TG_MAX_BODY 限制请求体大小
+
+依赖：teleagent_client.py 同目录
+"""
+import sys, os, json, time, argparse, threading, queue, re, hmac, uuid, socket
+import urllib.request, urllib.error
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from teleagent_client import Client, _headers, BASE as UPSTREAM  # noqa: E402
+from tg_sanitize import sanitize_system, sanitize_any, residual_hits, suspicion_scan  # noqa: E402
+
+DEFAULT_MODELS = ["chat-flagship", "chat-pro", "chat-flash", "chat-lite", "chat-nano"]
+MODEL_DESC = {
+    "chat-flagship": "旗舰 (最强推理)",
+    "chat-pro": "智能",
+    "chat-flash": "极速",
+    "chat-lite": "轻量(默认)",
+    "chat-nano": "轻速",
+}
+
+_state = {"client": None, "lock": threading.Lock()}
+_log_lock = threading.Lock()
+
+# 网关自身防护：请求体上限（防超大 body 打爆内存）与可选 API Key 校验。
+# TG_API_KEY 未设置时保持原来的“本机免鉴权”行为；绑定到非 127.0.0.1 时会告警。
+MAX_BODY_BYTES = int(os.environ.get("TG_MAX_BODY", str(8 * 1024 * 1024)))
+API_KEY = os.environ.get("TG_API_KEY", "").strip()
+
+# 运行统计与探活缓存：/pool/status 供节点代理采集，/health 只读缓存绝不阻塞。
+GATEWAY_VERSION = "2.3.0"
+STARTED_AT = time.time()
+TG_NODE_NAME = os.environ.get("TG_NODE_NAME", "").strip()
+
+_stats = {
+    "inflight": 0, "requests": 0, "streams": 0, "errors": 0,
+    "prompt_tokens": 0, "completion_tokens": 0, "last_error_at": 0,
+}
+_stats_lock = threading.Lock()
+_upstream = {"ok": None, "latency_ms": None, "at": 0, "key_set": False, "error": "", "state": "init"}
+
+
+def _stat_inc(key, n=1):
+    with _stats_lock:
+        _stats[key] = _stats.get(key, 0) + n
+
+
+def _stat_error():
+    with _stats_lock:
+        _stats["errors"] = _stats.get("errors", 0) + 1
+        _stats["last_error_at"] = int(time.time())
+
+
+def _stat_add_tokens(pi, po):
+    with _stats_lock:
+        _stats["prompt_tokens"] += int(pi or 0)
+        _stats["completion_tokens"] += int(po or 0)
+
+
+def log(msg):
+    with _log_lock:
+        print("[%s] %s" % (time.strftime("%H:%M:%S"), msg), flush=True)
+
+
+# ─────────────────────── key 管理 ───────────────────────
+def get_client(force_new=False):
+    with _state["lock"]:
+        if _state["client"] is None or force_new:
+            log("提取 sessionKey ...")
+            t0 = time.time()
+            _state["client"] = Client()
+            log("key 就绪 (%.1fs): %s..." % (time.time() - t0, _state["client"].key[:12]))
+        return _state["client"]
+
+
+def call_with_retry(method, path, body=None, timeout=300):
+    c = get_client()
+    st, raw = c.call(method, path, body, timeout=timeout)
+    if st == 401:
+        log("key 失效(401)，重新提取后重试")
+        c = get_client(force_new=True)
+        st, raw = c.call(method, path, body, timeout=timeout)
+    return st, raw
+
+
+# ─────────────────────── 探活（后台线程，状态接口只读缓存） ───────────────────────
+def _probe_once():
+    """每 15 秒探一次上游；没有 client 时在后台提取，期间状态保持 probing。"""
+    global _upstream
+    c = _state["client"]
+    if c is None:
+        _upstream = {"ok": None, "latency_ms": None, "at": int(time.time()),
+                     "key_set": False, "error": "", "state": "probing"}
+        try:
+            c = get_client()
+        except Exception as e:
+            _upstream = {"ok": False, "latency_ms": None, "at": int(time.time()),
+                         "key_set": False, "error": str(e), "state": "error"}
+            return
+    t0 = time.time()
+    try:
+        st, _ = c.call("GET", "/session", timeout=3)
+        ms = int((time.time() - t0) * 1000)
+        ok = st == 200
+        _upstream = {"ok": ok, "latency_ms": ms, "at": int(time.time()),
+                     "key_set": True, "error": "" if ok else "HTTP %s" % st,
+                     "state": "ok" if ok else "error"}
+    except Exception as e:
+        _upstream = {"ok": False, "latency_ms": None, "at": int(time.time()),
+                     "key_set": True, "error": str(e), "state": "error"}
+
+
+_probe_stop = threading.Event()
+
+
+def _probe_loop():
+    while not _probe_stop.is_set():
+        try:
+            _probe_once()
+        except Exception as e:
+            log("探活异常: %s" % e)
+        _probe_stop.wait(15)
+
+
+def _status_payload(full):
+    with _stats_lock:
+        stats = dict(_stats)
+    up = dict(_upstream)
+    up["key_set"] = _state["client"] is not None
+    now = time.time()
+    out = {
+        "ok": True,
+        "version": GATEWAY_VERSION,
+        "name": TG_NODE_NAME,
+        "models": DEFAULT_MODELS,
+        "time": int(now),
+        "auth_required": bool(API_KEY),
+    }
+    if not full:
+        return out
+    out.update({
+        "upstream": up,
+        "inflight": stats["inflight"],
+        "totals": {
+            "requests": stats["requests"],
+            "streams": stats["streams"],
+            "errors": stats["errors"],
+            "prompt_tokens": stats["prompt_tokens"],
+            "completion_tokens": stats["completion_tokens"],
+            "last_error_at": stats["last_error_at"],
+        },
+        "limits": {"max_body": MAX_BODY_BYTES, "max_prompt": MAX_PROMPT_CHARS},
+        "hostname": socket.gethostname(),
+        "uptime_sec": int(now - STARTED_AT),
+        "pid": os.getpid(),
+    })
+    return out
+
+
+# 上游处理能力有限：实测 2 万 token 约 1.7 秒返回；14 万字符（7-10 万 token）
+# 会让上游 300~900 秒后返超时空。超过阈值就截断，保留开头（系统提示）与结尾（最近对话）。
+MAX_PROMPT_CHARS = int(os.environ.get("TG_MAX_PROMPT", "40000"))
+
+# 系统提示词处理模式（TG_SYSTEM）：
+#   replace  默认。上游系统提示词整段丢弃，只发一句内置的干净角色设定。
+#            宿主那份几万字的提示词里有大量"人设/拒绝对抗/灰色规则"章节，
+#            逐行清洗永远漏，漏一行上游就回一句"这是注入我不采用"，所以直接不发。
+#   strip    连内置设定也不发，只发对话内容。
+#   filter   保留上游提示词，只用 tg_sanitize 做清洗（漏网风险自负）。
+SYSTEM_MODE = os.environ.get("TG_SYSTEM", "replace").strip().lower()
+if SYSTEM_MODE not in ("replace", "strip", "filter"):
+    SYSTEM_MODE = "replace"
+CLEAN_SYSTEM = os.environ.get(
+    "TG_SYSTEM_TEXT",
+    "你是运行在用户本机的 AI 助手，擅长编码、数据处理与办公文档任务。"
+    "请用简体中文回答；代码放在带语言标注的代码块里；直接给结论，简洁、不说教。",
+)
+# 想用自己写的提示词（例如 dsh-purge 的 prompt-inject.md）就直接指过去，
+# replace 模式会用它替代内置那句。
+_SYSFILE = os.environ.get("TG_SYSTEM_FILE", "").strip()
+SYSTEM_SOURCE = "内置"
+if _SYSFILE and os.path.exists(_SYSFILE):
+    try:
+        with open(_SYSFILE, encoding="utf-8") as _f:
+            _t = _f.read().strip()
+        if _t:
+            CLEAN_SYSTEM = _t
+            SYSTEM_SOURCE = "文件 %s" % _SYSFILE
+    except Exception as _e:
+        SYSTEM_SOURCE = "文件读取失败(%s): %s" % (_SYSFILE, _e)
+elif _SYSFILE:
+    SYSTEM_SOURCE = "文件不存在: %s" % _SYSFILE
+
+# 每次对话都会在 TeleAgent 后端建一个会话，这个会话会出现在客户端的历史列表里。
+# 默认用完即删，客户端就看不到对话记录；设 TG_KEEP_HISTORY=1 可保留（调试用）。
+KEEP_HISTORY = os.environ.get("TG_KEEP_HISTORY", "0") == "1"
+
+
+def drop_session(sid, why=""):
+    """删除本次产生的临时会话，避免在 TeleAgent 客户端留下对话记录。"""
+    if KEEP_HISTORY or not sid:
+        return
+    try:
+        st, _ = call_with_retry("DELETE", "/session/%s" % sid, timeout=20)
+        log("已清理临时会话 %s (HTTP %s)%s" % (sid, st, (" " + why) if why else ""))
+    except Exception as e:
+        log("清理临时会话失败 %s: %s" % (sid, e))
+
+
+def truncate_prompt(text, limit=None):
+    limit = limit or MAX_PROMPT_CHARS
+    if limit <= 0 or len(text) <= limit:
+        return text, False
+    head = int(limit * 0.35)
+    tail = limit - head
+    cut = len(text) - limit
+    return (text[:head]
+            + "\n\n...[中间 %d 字符因超出通道处理能力已省略]...\n\n" % cut
+            + text[-tail:]), True
+
+
+def trim_messages(messages, max_chars):
+    """按消息维度裁剪：保留全部 system，从最近往前保留对话，超长的工具输出单独截断。"""
+    if not isinstance(messages, list) or not messages:
+        return messages, False
+    systems = [m for m in messages if m.get("role") == "system"]
+    others = [m for m in messages if m.get("role") != "system"]
+
+    def clen(m):
+        c = m.get("content")
+        return len(c) if isinstance(c, str) else len(json.dumps(c, ensure_ascii=False))
+
+    # 系统提示词的实际开销：replace/strip 模式下它根本不发给上游，不能占预算。
+    # （踩过的坑：按原长计入，5 万字系统提示词一上来就把预算吃光，
+    #  结果只留下最后一条消息——而宿主会把时间/环境上下文追加在末尾，
+    #  于是真正的问题被裁掉，模型只看到一条时间元数据。）
+    if SYSTEM_MODE == "filter":
+        total = sum(len(sanitize_system(m.get("content") or "")[0]) for m in systems)
+    else:
+        total = len(CLEAN_SYSTEM) if (SYSTEM_MODE == "replace" and systems) else 0
+    kept = []
+    dropped = 0
+    # 无论预算如何，最近 MIN_KEEP 条对话必须保留，保证用户当下这句话一定在
+    MIN_KEEP = int(os.environ.get("TG_MIN_KEEP", "3"))
+    for m in reversed(others):
+        L = clen(m)
+        # 单条工具结果过长 → 就地截断，避免一条撑爆
+        if L > 6000:
+            m2 = dict(m)
+            c = m2.get("content")
+            if isinstance(c, str):
+                m2["content"] = c[:6000] + "\n...[单条内容过长已截断]"
+            m = m2
+            L = clen(m)
+        if total + L > max_chars and len(kept) >= MIN_KEEP:
+            dropped += 1
+            continue
+        kept.append(m)
+        total += L
+
+    if not dropped:
+        return messages, False
+    return systems + list(reversed(kept)), True
+
+
+def _dump_prompt(tag, text):
+    """TG_DUMP=1 时把系统提示词落盘，便于按真实内容校准清洗规则。"""
+    if os.environ.get("TG_DUMP") != "1":
+        return
+    try:
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompt-dump-%s.txt" % tag)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(text)
+    except Exception:
+        pass
+
+
+def messages_to_text(messages):
+    if not isinstance(messages, list):
+        return str(messages)
+    if len(messages) == 1 and messages[0].get("role") == "user":
+        c = messages[0].get("content")
+        if not isinstance(c, str):
+            c = json.dumps(c, ensure_ascii=False)
+        orig = c
+        c, meta_cut = sanitize_any(c)
+        if meta_cut:
+            log("已剔除用户消息中的宿主元信息（%d -> %d 字符）" % (len(orig), len(c)))
+        return c if c.strip() else orig
+    lines = []
+    sys_sent = False
+    for m in messages:
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        if isinstance(content, list):
+            content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
+        if content is None:
+            # OpenAI 的 assistant 工具调用消息 content 为 null，这里还原成可读文本
+            tcs = m.get("tool_calls") or []
+            content = json.dumps([
+                {"name": (tc.get("function") or {}).get("name"),
+                 "arguments": (tc.get("function") or {}).get("arguments")}
+                for tc in tcs
+            ], ensure_ascii=False) if tcs else ""
+        if isinstance(content, str):
+            if role == "system":
+                _dump_prompt("raw", content)
+                if SYSTEM_MODE == "strip":
+                    if not sys_sent:
+                        log("系统提示词已丢弃（strip 模式，%d 字符不发给上游）" % len(content))
+                        sys_sent = True
+                    continue
+                if SYSTEM_MODE == "replace":
+                    if not sys_sent:
+                        log("系统提示词已替换（%d 字符 -> 内置 %d 字符）"
+                            % (len(content), len(CLEAN_SYSTEM)))
+                        sys_sent = True
+                        content = CLEAN_SYSTEM
+                    else:
+                        continue
+                else:
+                    cleaned, changed = sanitize_system(content)
+                    _dump_prompt("clean", cleaned)
+                    if changed:
+                        log("系统提示词已清洗: %d -> %d 字符（去掉上游会当作注入的人设/越狱话术）"
+                            % (len(content), len(cleaned)))
+                        left = residual_hits(cleaned)
+                        if left:
+                            log("清洗后仍有可疑模式 %d 处: %s" % (len(left), ", ".join(left[:4])))
+                        scan = suspicion_scan(cleaned)
+                        if scan:
+                            log("残留可疑词统计(类别:次数): %s"
+                                % ", ".join("%s:%d" % (k, v) for k, v in sorted(scan.items())))
+                    content = cleaned
+            else:
+                orig_len = len(content)
+                content, meta_cut = sanitize_any(content)
+                if meta_cut and not content.strip():
+                    # 整条都是宿主追加的元信息（运行时快照/技能清单），丢掉，别让上游读成注入
+                    log("丢弃纯元信息消息（%d 字符）" % orig_len)
+                    continue
+                if meta_cut:
+                    log("已剔除用户消息中的宿主元信息（%d -> %d 字符）" % (orig_len, len(content)))
+        if role == "system":
+            # 系统设定不加"系统:"前缀——上游会把"系统: xxx"当成伪造系统消息的注入
+            # （实测：加了前缀它就回"那段以「系统:」开头的人设设定我不会采用"）
+            lines.append(content)
+            continue
+        label = {"user": "用户", "assistant": "助手", "tool": "工具"}.get(role, role)
+        lines.append("%s: %s" % (label, content))
+    return "\n\n".join(lines)
+
+
+# ─────────────────── tools / function calling 桥接 ───────────────────
+# 4397 通道只能发纯文本，没有原生 function calling。这里用一段 JSON 协议桥接：
+# 需要调用工具时，模型只输出 {"tool_calls":[{"name":...,"arguments":{...}}]}，
+# 网关解析后转成标准 OpenAI tool_calls。模型不按协议输出时按普通文本返回（安全降级）。
+def build_tool_prompt(tools, tool_choice):
+    if tool_choice == "none":
+        return ""
+    specs = []
+    for t in tools if isinstance(tools, list) else []:
+        fn = t.get("function") if isinstance(t, dict) and t.get("type", "function") == "function" else None
+        if not isinstance(fn, dict) or not fn.get("name"):
+            continue
+        specs.append({
+            "name": fn["name"],
+            "description": fn.get("description") or "",
+            "parameters": fn.get("parameters") or {},
+        })
+    if not specs:
+        return ""
+    force = ""
+    if isinstance(tool_choice, dict):
+        name = (tool_choice.get("function") or {}).get("name")
+        if name:
+            force = "本轮必须调用工具 %s，不要直接回答。\n" % name
+    elif tool_choice == "required":
+        force = "本轮必须调用至少一个工具，不要直接回答。\n"
+    return (
+        "\n\n[工具调用协议]\n"
+        "你可以调用下列本机工具。需要调用时，只输出一行 JSON，"
+        "不要输出解释、Markdown 或代码围栏：\n"
+        '{"tool_calls":[{"name":"工具名","arguments":{"参数名":值}}]}\n'
+        "arguments 必须符合对应工具的 JSON Schema。不需要调用工具时，正常回答用户。\n"
+        + force +
+        "工具列表（JSON）：\n" + json.dumps(specs, ensure_ascii=False)
+    )
+
+
+def parse_tool_calls(text):
+    """从模型回复里提取 tool_calls；不合法/未调用时返回 None。"""
+    if not isinstance(text, str) or "tool_calls" not in text:
+        return None
+    s = text.strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```[A-Za-z0-9_-]*\s*", "", s)
+        s = re.sub(r"\s*```$", "", s)
+    dec = json.JSONDecoder()
+    idx = 0
+    while True:
+        i = s.find("{", idx)
+        if i < 0:
+            return None
+        try:
+            obj, end = dec.raw_decode(s[i:])
+        except Exception:
+            idx = i + 1
+            continue
+        idx = i + end
+        calls = obj.get("tool_calls") if isinstance(obj, dict) else None
+        if not isinstance(calls, list):
+            continue
+        out = []
+        for c in calls:
+            if not isinstance(c, dict):
+                continue
+            fn = c.get("function") if isinstance(c.get("function"), dict) else {}
+            name = c.get("name") or fn.get("name")
+            args = c.get("arguments", fn.get("arguments"))
+            if not name:
+                continue
+            if not isinstance(args, str):
+                args = json.dumps(args if args is not None else {}, ensure_ascii=False)
+            out.append({"name": name, "arguments": args})
+        if out:
+            return out
+    return None
+
+
+def _openai_tool_calls(calls):
+    return [{
+        "id": "call_%s" % uuid.uuid4().hex[:24],
+        "type": "function",
+        "function": {"name": c["name"], "arguments": c["arguments"]},
+    } for c in calls]
+
+
+# ─────────────────────── HTTP ───────────────────────
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _json(self, code, obj):
+        data = json.dumps(obj, ensure_ascii=False).encode()
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception:
+            pass
+
+    def _authorized(self):
+        """TG_API_KEY 未设置时放行（仅本机使用）；设置后校验 Bearer / x-api-key。"""
+        if not API_KEY:
+            return True
+        auth = self.headers.get("Authorization") or ""
+        key = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+        if not key:
+            key = (self.headers.get("x-api-key") or "").strip()
+        if key and hmac.compare_digest(key, API_KEY):
+            return True
+        self._json(401, {"error": {"message": "invalid api key", "type": "invalid_request_error"}})
+        return False
+
+    def _read_body(self):
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = 0
+        if n <= 0:
+            return {}
+        if n > MAX_BODY_BYTES:
+            # 先丢掉请求体再回 413，避免客户端还在发送时只看到连接重置
+            if n <= MAX_BODY_BYTES * 4:
+                try:
+                    self.rfile.read(n)
+                except Exception:
+                    pass
+            self._json(413, {"error": {
+                "message": "request body too large (limit %d bytes)" % MAX_BODY_BYTES,
+                "type": "invalid_request_error"}})
+            return None
+        try:
+            return json.loads(self.rfile.read(n).decode("utf-8", "replace"))
+        except Exception:
+            return {}
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        self.end_headers()
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        if path in ("/v1/models", "/models"):
+            if not self._authorized():
+                return
+            now = int(time.time())
+            self._json(200, {"object": "list", "data": [
+                {"id": m, "object": "model", "created": now, "owned_by": "teleagent",
+                 "description": MODEL_DESC.get(m, "")} for m in DEFAULT_MODELS]})
+            return
+        if path == "/pool/status":
+            # 网关默认只监听 127.0.0.1；无 TG_API_KEY 时也返回完整状态，
+            # 否则节点代理上报不了 upstream，池会一直把该节点判为不可用。
+            if API_KEY and not self._authorized():
+                return
+            self._json(200, _status_payload(True))
+            return
+        if path == "/health":
+            up = dict(_upstream)
+            if up.get("ok") is True:
+                code, status = 200, "ok"
+            elif up.get("ok") is False:
+                code, status = 503, "error"
+            else:
+                code, status = 200, "probing"
+            self._json(code, {"status": status, "upstream": up})
+            return
+        self._json(404, {"error": {"message": "not found", "type": "invalid_request_error"}})
+
+    def do_POST(self):
+        path = self.path.split("?")[0]
+        if path not in ("/v1/chat/completions", "/chat/completions"):
+            self._json(404, {"error": {"message": "not found"}})
+            return
+
+        body = self._read_body()
+        if body is None:
+            return
+        if not self._authorized():
+            return
+        if not isinstance(body, dict):
+            self._json(400, {"error": {"message": "body must be a JSON object",
+                                       "type": "invalid_request_error"}})
+            return
+        _stat_inc("requests")
+        _stat_inc("inflight")
+        if bool(body.get("stream")):
+            _stat_inc("streams")
+        model = body.get("model") or "chat-lite"
+        stream = bool(body.get("stream"))
+        raw_msgs = body.get("messages") or []
+        msgs, msgs_cut = trim_messages(raw_msgs, MAX_PROMPT_CHARS)
+        text = messages_to_text(msgs)
+        tools = body.get("tools") or []
+        tool_prompt = build_tool_prompt(tools, body.get("tool_choice"))
+        if tool_prompt:
+            text += tool_prompt
+        rf = body.get("response_format")
+        if isinstance(rf, dict) and rf.get("type") == "json_object":
+            text += "\n\n[输出格式] 只输出一个合法 JSON 对象，不要输出 Markdown 代码围栏或额外说明。"
+        text, text_cut = truncate_prompt(text)
+        if msgs_cut or text_cut:
+            log("%s prompt 超限已裁剪: %d 条消息 -> %d 条，%d 字符"
+                % (model, len(raw_msgs), len(msgs), len(text)))
+        want_usage = bool((body.get("stream_options") or {}).get("include_usage"))
+        t_req = time.time()
+        log("%s 请求 %s prompt=%d 字符 stream=%s%s" % (
+            model, self.path.split("?")[0], len(text), "是" if stream else "否",
+            (" tools=%d" % len(tools)) if tools else ""))
+
+        sid = None
+        try:
+            c = get_client()
+            sid = c.new_session(title="gw")
+            if stream:
+                self._do_stream(sid, model, text, want_usage, t_req)
+            else:
+                self._do_block(sid, model, text, t_req)
+        except Exception as e:
+            log("请求异常: %s" % e)
+            _stat_error()
+            try:
+                self._json(500, {"error": {"message": str(e), "type": "server_error"}})
+            except Exception:
+                pass
+        finally:
+            _stat_inc("inflight", -1)
+            # 无论成功、失败还是客户端中断，都把临时会话删掉
+            drop_session(sid)
+
+    # ── 非流式：等完整回复 ──
+    def _do_block(self, sid, model, text, t_req):
+        st, raw = call_with_retry("POST", "/session/%s/message" % sid, {
+            "parts": [{"type": "text", "text": text}],
+            "model": {"providerID": "NewApi", "modelID": model},
+        })
+        el = time.time() - t_req
+        if st != 200:
+            log("%s 非流式失败 HTTP %s (%.1fs)" % (model, st, el))
+            _stat_error()
+            self._json(500, {"error": {
+                "message": "upstream %s: %s" % (st, raw[:300].decode("utf-8", "replace")),
+                "type": "upstream_error"}})
+            return
+        j = json.loads(raw)
+        data = j.get("data", {})
+        info = data.get("info", {})
+        parts = data.get("parts") or []
+        reply = "".join(p.get("text", "") for p in parts if p.get("type") == "text")
+        usage = info.get("tokens") or {}
+        pi, po = usage.get("input", 0), usage.get("output", 0)
+        _stat_add_tokens(pi, po)
+        calls = parse_tool_calls(reply)
+        if calls:
+            log("%s 非流式完成（tool_calls %d 个）in=%s out=%s (%.1fs)"
+                % (model, len(calls), pi, po, el))
+            message = {"role": "assistant", "content": None,
+                       "tool_calls": _openai_tool_calls(calls)}
+            finish = "tool_calls"
+        else:
+            log("%s 非流式完成 in=%s out=%s (%.1fs)" % (model, pi, po, el))
+            message = {"role": "assistant", "content": reply}
+            finish = "stop"
+        self._json(200, {
+            "id": "chatcmpl-%s" % sid, "object": "chat.completion",
+            "created": int(time.time()), "model": model,
+            "choices": [{"index": 0, "message": message, "finish_reason": finish}],
+            "usage": {"prompt_tokens": pi, "completion_tokens": po,
+                      "total_tokens": pi + po},
+        })
+
+    # ── 真流式：订阅 /event 转发 delta ──
+    def _do_stream(self, sid, model, text, want_usage, t_req):
+        q = queue.Queue()
+        stop = threading.Event()
+
+        def listener():
+            try:
+                c = get_client()
+                h = _headers(c.key, "GET", "/event")
+                h["Accept"] = "text/event-stream"
+                req = urllib.request.Request(UPSTREAM + "/event", headers=h)
+                with urllib.request.urlopen(req, timeout=1800) as r:
+                    while not stop.is_set():
+                        line = r.readline()
+                        if not line:
+                            break
+                        if line.startswith(b"data: "):
+                            try:
+                                q.put(json.loads(line[6:]))
+                            except Exception:
+                                pass
+            except Exception as e:
+                q.put({"_error": str(e)})
+
+        # 先监听，再发消息（否则前面的 delta 会漏）
+        threading.Thread(target=listener, daemon=True).start()
+        time.sleep(0.35)
+
+        holder = {}
+
+        t_send = [None]
+
+        def sender():
+            try:
+                t_send[0] = time.time()
+                st, raw = call_with_retry("POST", "/session/%s/message" % sid, {
+                    "parts": [{"type": "text", "text": text}],
+                    "model": {"providerID": "NewApi", "modelID": model},
+                })
+                holder["st"], holder["raw"] = st, raw
+                log("%s sender 完成 HTTP %s %d 字节，用时 %.2fs" % (
+                    model, st, len(raw), time.time() - t_send[0]))
+            except Exception as e:
+                holder["err"] = str(e)
+
+        threading.Thread(target=sender, daemon=True).start()
+
+        # 立刻回响应头 + role chunk，客户端马上就有反馈
+        cid = "chatcmpl-%s" % sid
+        log("%s 流式开始 (prompt≈%d 字符)" % (model, len(text)))
+        created = int(time.time())
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+        except Exception:
+            return
+
+        dead = threading.Event()
+
+        def emit(obj):
+            if dead.is_set():
+                return False
+            try:
+                self.wfile.write(b"data: " + json.dumps(obj, ensure_ascii=False).encode() + b"\n\n")
+                self.wfile.flush()
+                return True
+            except Exception:
+                dead.set()
+                return False
+
+        def chunk(delta, fin=None):
+            # 必须 return：调用处用 `if not chunk(...)` 判断连接是否还活着
+            return emit({"id": cid, "object": "chat.completion.chunk", "created": created,
+                         "model": model,
+                         "choices": [{"index": 0, "delta": delta, "finish_reason": fin}]})
+
+        chunk({"role": "assistant"})
+
+        first_token_at = [None]
+        last_beat = time.time()
+        got_any = False
+        usage = {}
+        sent_text = []
+        first_pid = [None]
+        buf_first = []
+        second_seen = [False]
+        drained_at = [None]
+
+        while True:
+            # 上游已完成：再给事件流 2 秒排空剩余 delta（否则会截断）
+            if "raw" in holder or "err" in holder:
+                if drained_at[0] is None:
+                    drained_at[0] = time.time()
+                elif time.time() - drained_at[0] > 2.0 and q.empty():
+                    break
+            try:
+                ev = q.get(timeout=0.3)
+            except queue.Empty:
+                ev = None
+
+            if ev is None:
+                # 心跳保活（等待上游期间）
+                if time.time() - last_beat >= 3.0:
+                    try:
+                        self.wfile.write(b": keepalive\n\n")
+                        self.wfile.flush()
+                    except Exception:
+                        dead.set()
+                        break
+                    last_beat = time.time()
+                continue
+
+            if "_error" in ev:
+                log("事件流错误: %s" % ev["_error"])
+                break
+
+            et = ev.get("type")
+            pr = ev.get("properties") or {}
+            if pr.get("sessionID") != sid:
+                continue
+
+            # message.part.delta 不带 part 类型，但按 partID 分组推送。
+            # 实测规律：reasoning 的 part 先出现，答案(text) 的 part 后出现。
+            # 策略：跳过第一个 partID（通常是 reasoning），此后只转发新 partID 的 delta。
+            # 完整内容在循环结束后用 message API 的同步结果兜底补齐。
+            if et == "message.part.delta":
+                pid2 = pr.get("partID")
+                if pid2 is None:
+                    continue
+                d = pr.get("delta") or ""
+                if not d:
+                    continue
+                if first_token_at[0] is None:
+                    first_token_at[0] = time.time() - t_req
+                    log("%s 首字 %.1fs" % (model, first_token_at[0]))
+                # opencode 的 delta 不带 part 类型（reasoning 与正文混在一起，且可能丢首字符），
+                # 因此一律作为 reasoning_content 转发做实时反馈；
+                # 正文在结束后用 message API 的同步结果统一发出，保证干净、无重复。
+                if not chunk({"reasoning_content": d}):
+                    break
+            elif et == "message.updated":
+                info = pr.get("info") or {}
+                if info.get("role") == "assistant":
+                    tk = info.get("tokens") or {}
+                    if tk:
+                        usage = tk
+
+        stop.set()
+
+        el = time.time() - t_req
+        st = holder.get("st")
+
+        # 正文一律以 message API 的同步结果为准（delta 只承担 reasoning 实时展示）
+        finish_reason = "stop"
+        if not holder.get("err") and st == 200:
+            try:
+                j = json.loads(holder["raw"])
+                data = j.get("data") or {}
+                parts = data.get("parts") or []
+                full = "".join(p.get("text", "") for p in parts if p.get("type") == "text")
+                if not usage:
+                    usage = (data.get("info") or {}).get("tokens") or {}
+                calls = parse_tool_calls(full)
+                if calls:
+                    wire = _openai_tool_calls(calls)
+                    for i, tc in enumerate(wire):
+                        tc["index"] = i
+                    finish_reason = "tool_calls"
+                    chunk({"tool_calls": wire})
+                    got_any = True
+                elif full:
+                    step = 60
+                    for i in range(0, len(full), step):
+                        if not chunk({"content": full[i:i + step]}):
+                            break
+                    got_any = True
+            except Exception:
+                pass
+
+        if holder.get("err"):
+            log("%s 流式失败 %s (%.1fs)" % (model, holder["err"][:60], el))
+            _stat_error()
+            chunk({"content": "\n[网关错误: %s]" % holder["err"][:200]}, "stop")
+        elif st and st != 200:
+            log("%s 流式上游 %s (%.1fs)" % (model, st, el))
+            _stat_error()
+            chunk({"content": "\n[上游 %s: %s]" % (st, holder.get("raw", b"")[:200].decode("utf-8", "replace"))}, "stop")
+        else:
+            chunk({}, finish_reason)
+
+        if want_usage and usage:
+            emit({"id": cid, "object": "chat.completion.chunk", "created": created,
+                  "model": model, "choices": [],
+                  "usage": {"prompt_tokens": usage.get("input", 0),
+                            "completion_tokens": usage.get("output", 0),
+                            "total_tokens": usage.get("input", 0) + usage.get("output", 0)}})
+
+        try:
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except Exception:
+            pass
+        # 收尾关连接：有些客户端读到 EOF 才认为流结束，挂着 keep-alive 会让它干等
+        try:
+            self.close_connection = True
+        except Exception:
+            pass
+
+        _stat_add_tokens(usage.get("input", 0), usage.get("output", 0))
+        log("%s 流式完成 in=%s out=%s 首字=%s 总耗时=%.1fs%s" % (
+            model, usage.get("input", 0), usage.get("output", 0),
+            ("%.1fs" % first_token_at[0]) if first_token_at[0] else "无",
+            el, "" if got_any else " [无内容]"))
+
+
+def create_gateway(host="127.0.0.1", port=8899, prewarm=True):
+    """创建网关 HTTP 服务并启动探活线程；调用方负责 serve_forever。
+
+    图形界面（node_gui.py）用它把网关内嵌到同一个进程里。
+    """
+    if prewarm:
+        try:
+            get_client()
+        except Exception as e:
+            log("预提取失败（请求时会重试）: %s" % e)
+
+    _probe_stop.clear()
+    threading.Thread(target=_probe_loop, daemon=True).start()
+
+    srv = ThreadingHTTPServer((host, port), Handler)
+    srv.daemon_threads = True
+    log("已启动 http://%s:%d/v1（v%s）" % (host, port, GATEWAY_VERSION))
+    log("模型: %s" % ", ".join(DEFAULT_MODELS))
+    log("系统提示词模式: %s（replace/strip/filter），生效来源: %s，%d 字符" % (SYSTEM_MODE, SYSTEM_SOURCE, len(CLEAN_SYSTEM)))
+    log("鉴权: %s；请求体上限: %d 字节" % ("TG_API_KEY 已启用" if API_KEY else "未启用（仅建议本机使用）", MAX_BODY_BYTES))
+    if host not in ("127.0.0.1", "localhost", "::1") and not API_KEY:
+        log("警告: 监听 %s 且未设置 TG_API_KEY，同网段任何人都能消耗账号积分" % host)
+    return srv
+
+
+def stop_gateway(srv=None):
+    """停止探活线程并关闭监听（在非 serve_forever 线程调用）。"""
+    _probe_stop.set()
+    if srv is not None:
+        try:
+            srv.shutdown()
+        except Exception:
+            pass
+        try:
+            srv.server_close()
+        except Exception:
+            pass
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=8899)
+    ap.add_argument("--no-prewarm", action="store_true")
+    args = ap.parse_args()
+
+    srv = create_gateway(args.host, args.port, prewarm=not args.no_prewarm)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        log("已停止")
+    finally:
+        stop_gateway(srv)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,15 @@
+{
+  "name": "teleagent-dashboard",
+  "version": "2.2.0",
+  "description": "TeleAgent cloud PC keepalive + daily points + power management console",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
