@@ -22,6 +22,7 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+import webbrowser
 
 import tkinter as tk
 from tkinter import messagebox, scrolledtext, ttk
@@ -175,6 +176,11 @@ class App:
         self.btn_stop.pack(side="left", padx=(8, 0))
         self.btn_test.pack(side="left", padx=(8, 0))
         self.btn_clear.pack(side="right")
+
+        self.link_gh = tk.Label(bar, text="★ GitHub 项目主页", fg="#2563eb", cursor="hand2")
+        self.link_gh.pack(side="left", padx=(16, 0))
+        self.link_gh.bind("<Button-1>", lambda e: webbrowser.open(
+            "https://github.com/shixiangkuangmo/teleagent"))
 
         self.status = tk.Label(bar, text="● 未启动", fg="#8a8a8a")
         self.status.pack(side="right", padx=12)

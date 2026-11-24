@@ -2,7 +2,15 @@
 
 把 **TeleAgent 云电脑账号** 变成一套可管理的算力池：服务器统一保活多账号、统一暴露 OpenAI 兼容接口，多台 Windows 机器作为节点通过出站 WebSocket 接入，无需公网 IP，NAT 后也能用。
 
+[![GitHub stars](https://img.shields.io/github/stars/shixiangkuangmo/teleagent?style=social)](https://github.com/shixiangkuangmo/teleagent)
+[![GitHub forks](https://img.shields.io/github/forks/shixiangkuangmo/teleagent?style=social)](https://github.com/shixiangkuangmo/teleagent/fork)
+![Node.js](https://img.shields.io/badge/Node.js-18%2B-339933?logo=node.js&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)
+
 > 个人自用项目，用于管理自己的账号与配额。请遵守 TeleAgent 服务条款，不要用于转售或对外提供公共服务。
+
+> ⭐ **如果这个项目对你有帮助，点个 Star 支持一下**，这是我持续维护和更新的最大动力。
 
 ---
 
@@ -55,6 +63,10 @@
 - 登录凭据加密落盘，JWT 自动重登后重新绑定到 API 与保活模块
 - 面板密码保护（明文或用 `sha256("user:密码")` 哈希）
 
+![账号保活面板](docs/images/accounts.png)
+
+<p align="center"><sub>账号面板：在线状态、实例、保活、积分与免费到期天数一屏掌握</sub></p>
+
 ### 本机网关（OpenAI 兼容）
 
 - `GET /v1/models`、`POST /v1/chat/completions`
@@ -65,6 +77,10 @@
 - 超长 prompt 自动截断（保留开头系统提示 + 最近对话）
 - 可选 `TG_API_KEY` Bearer 鉴权、请求体大小限制、临时会话自动清理
 - `/pool/status` 供节点代理采集，`/health` 只读缓存、不阻塞
+
+![网关实际对话效果](docs/images/proxy-test.png)
+
+<p align="center"><sub>通过网关调用本机 TeleAgent 通道的实际回复（chat-flash）</sub></p>
 
 ### 网关池（多机分布式）
 
@@ -78,6 +94,10 @@
 - 用量：按天聚合总量 / 分节点 / 分 Key / 分模型，保留 30 天
 - 45 秒无心跳判离线并摘除，离线可复用面板通知渠道
 - 面板内置「网关池」视图：节点表、Key 表、用量表，全部可视化操作
+
+![网关池面板](docs/images/pool.png)
+
+<p align="center"><sub>网关池：节点在线/上游延迟、池 Key 限额、按节点与按 Key 的当日用量</sub></p>
 
 ---
 
@@ -387,7 +407,15 @@ curl https://panel.example.com/v1/chat/completions \
 
 ---
 
-## 十、免责声明
+## 十、Star 趋势
+
+[![Star History Chart](https://api.star-history.com/svg?repos=shixiangkuangmo/teleagent&type=Date)](https://star-history.com/#shixiangkuangmo/teleagent&Date)
+
+如果这个项目帮你省了时间，欢迎 **Star**、Fork、提 Issue。你的每一个 Star 都会被看到。
+
+---
+
+## 十一、免责声明
 
 本项目仅用于学习与个人账号管理，不提供任何形式的服务担保。使用者需自行确保：
 

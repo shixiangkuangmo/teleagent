@@ -74,7 +74,8 @@ code,.mono{font-family:"SF Mono",ui-monospace,Consolas,monospace}
 .live.on i{background:var(--ok);box-shadow:0 0 0 3px rgba(61,220,151,.16)}
 .live.off i{background:var(--err);box-shadow:0 0 0 3px rgba(255,107,107,.16)}
 .ibtn{width:31px;height:31px;border-radius:9px;border:1px solid var(--line);background:var(--soft);
-  color:var(--sub);cursor:pointer;font-size:14px;display:grid;place-items:center;transition:.15s}
+  color:var(--sub);cursor:pointer;font-size:14px;display:grid;place-items:center;transition:.15s;
+  text-decoration:none}
 .ibtn:hover{color:var(--txt);background:var(--soft2);border-color:var(--line2)}
 .ibtn.spin{animation:spin .7s linear}
 @keyframes spin{to{transform:rotate(360deg)}}
@@ -253,6 +254,7 @@ tbody tr.sel{background:var(--rowsel)}
   <div class="stats" id="stats"></div>
   <div class="topright">
     <div class="live" id="live"><i></i><span id="livetxt">连接中</span></div>
+    <a class="ibtn" href="https://github.com/shixiangkuangmo/teleagent" target="_blank" rel="noopener" title="项目主页 · 求 Star ⭐">★</a>
     <button class="ibtn" id="btn-theme" title="切换主题">☀</button>
     <button class="ibtn" id="btn-refresh" title="立即刷新">⟳</button>
     <button class="ibtn" id="btn-logout" title="退出登录">⏻</button>
