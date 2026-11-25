@@ -1004,34 +1004,74 @@ class Handler(BaseHTTPRequestHandler):
             el, "" if got_any else " [无内容]"))
 
 
-def ensure_upstream_no_tools():
-    """在会话目录写 opencode.json，关掉上游 agent 自己的工具。
+def _opencode_config_paths():
+    """opencode 会加载的项目/全局配置路径（项目级 + 用户级都写一份）。"""
+    home = os.path.expanduser("~")
+    paths = [
+        os.path.join(SESSION_DIR, "opencode.json"),
+        os.path.join(home, ".config", "opencode", "opencode.json"),
+    ]
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        paths.append(os.path.join(appdata, "opencode", "opencode.json"))
+    return paths
 
-    4397 是完整的 opencode agent，prompt 里的 tools 开关不被这个版本接受，
-    模型会自己 read/bash/edit，把成果写进会话临时目录，客户端只能看到
-    「说到一半就结束」。opencode 按会话所在目录读项目级配置，所以把
-    tools 全关掉写在 SESSION_DIR 里最稳。改完需要重启 TeleAgent 客户端生效。
+
+def ensure_upstream_no_tools():
+    """把上游原生工具关掉。
+
+    这个版本的 4397 不认请求体里的 tools 开关，只能走 opencode 配置。
+    项目级配置（会话目录）不一定被加载，所以用户级 ~/.config/opencode
+    也写一份——节点机器上的 TeleAgent 本来就只当模型后端用，关掉它
+    自己的 read/bash/edit 正是我们想要的效果。已有配置会被保留，只
+    覆盖 tools 里的对应项。
     """
-    cfg = {
-        "$schema": "https://opencode.ai/config.json",
-        "tools": upstream_tools_off(),
-    }
-    try:
-        os.makedirs(SESSION_DIR, exist_ok=True)
-        p = os.path.join(SESSION_DIR, "opencode.json")
-        data = json.dumps(cfg, ensure_ascii=False, indent=2) + "\n"
-        old = None
+    tools = upstream_tools_off()
+    for p in _opencode_config_paths():
         try:
-            with open(p, encoding="utf-8") as f:
-                old = f.read()
-        except Exception:
-            pass
-        if old != data:
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            cfg = {}
+            if os.path.exists(p):
+                try:
+                    with open(p, encoding="utf-8") as f:
+                        cfg = json.load(f) or {}
+                except Exception:
+                    # 已有配置不是合法 JSON 就别动，免得把用户的东西写坏
+                    log("跳过 %s：已有内容不是合法 JSON，需手动处理" % p)
+                    continue
+                if not isinstance(cfg, dict):
+                    continue
+            cur = cfg.get("tools")
+            cur = cur if isinstance(cur, dict) else {}
+            merged = dict(cur)
+            merged.update(tools)
+            if merged == cur and "tools" in cfg:
+                continue
+            cfg["$schema"] = "https://opencode.ai/config.json"
+            cfg["tools"] = merged
             with open(p, "w", encoding="utf-8") as f:
-                f.write(data)
-            log("已写入 %s：关闭上游原生工具（重启 TeleAgent 客户端后生效）" % p)
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+            log("已更新 %s：关闭上游原生工具（重启 TeleAgent 客户端后生效）" % p)
+        except Exception as e:
+            log("写入 %s 失败: %s" % (p, e))
+
+
+def probe_upstream_config():
+    """读一次上游 /config，确认 tools 配置到底有没有被加载。"""
+    try:
+        c = get_client()
+        st, raw = c.call("GET", "/config", None, timeout=8)
+        if st != 200:
+            log("[config] 上游 /config HTTP %s" % st)
+            return
+        obj = json.loads(raw.decode("utf-8", "replace"))
+        tools = obj.get("tools") if isinstance(obj, dict) else None
+        off = sum(1 for v in (tools or {}).values() if v is False)
+        log("[config] 上游 tools: %s（已关闭 %d 项）" % (
+            "未配置" if tools is None else "已加载", off))
     except Exception as e:
-        log("写入 opencode.json 失败: %s" % e)
+        log("[config] 读取上游 /config 失败: %s" % e)
 
 
 def create_gateway(host="127.0.0.1", port=8899, prewarm=True):
@@ -1048,6 +1088,7 @@ def create_gateway(host="127.0.0.1", port=8899, prewarm=True):
 
     _probe_stop.clear()
     threading.Thread(target=_probe_loop, daemon=True).start()
+    threading.Thread(target=probe_upstream_config, daemon=True).start()
 
     srv = ThreadingHTTPServer((host, port), Handler)
     srv.daemon_threads = True
