@@ -762,6 +762,8 @@ class Handler(BaseHTTPRequestHandler):
         usage = {}
         sent_text = []
         delta_acc = []
+        content_sent = []
+        text_pids = set()
         first_pid = [None]
         buf_first = []
         second_seen = [False]
@@ -780,13 +782,11 @@ class Handler(BaseHTTPRequestHandler):
                 ev = None
 
             if ev is None:
-                # 心跳保活（等待上游期间）
-                if time.time() - last_beat >= 3.0:
-                    try:
-                        self.wfile.write(b": keepalive\n\n")
-                        self.wfile.flush()
-                    except Exception:
-                        dead.set()
+                # 心跳保活：Trae 的 stream_idle_timeout 只认 data: 帧，SSE 注释行
+                # 会被当成静默，所以发一个带零宽空格的合法 content 增量，
+                # 客户端视为有输出进度，但正文里不可见。
+                if time.time() - last_beat >= 8.0:
+                    if not chunk({"content": "\u200b"}):
                         break
                     last_beat = time.time()
                 continue
@@ -814,12 +814,25 @@ class Handler(BaseHTTPRequestHandler):
                 if first_token_at[0] is None:
                     first_token_at[0] = time.time() - t_req
                     log("%s 首字 %.1fs" % (model, first_token_at[0]))
-                # opencode 的 delta 不带 part 类型（reasoning 与正文混在一起，且可能丢首字符），
-                # 因此一律作为 reasoning_content 转发做实时反馈；
-                # 正文在结束后用 message API 的同步结果统一发出，保证干净、无重复。
                 delta_acc.append(d)
-                if not chunk({"reasoning_content": d}):
-                    break
+                last_beat = time.time()
+                # properties.field == "text" 是正文增量（与 openai_proxy 的做法一致），
+                # 其余是思考。正文必须实时发送：只发 reasoning_content 时 Trae 收不到
+                # content，会判定 stream_idle_timeout 直接掐断。
+                # sender 返回完整文本后再按已发内容补齐差异，避免重复。
+                is_text = (pr.get("field") == "text") or (pid2 in text_pids)
+                if is_text:
+                    content_sent.append(d)
+                    if not chunk({"content": d}):
+                        break
+                else:
+                    if not chunk({"reasoning_content": d}):
+                        break
+            elif et == "message.part.updated":
+                # 记录正文 part 的 id，delta 没带 field 时用它兜底判断
+                part = pr.get("part") or {}
+                if part.get("type") == "text" and part.get("id"):
+                    text_pids.add(part.get("id"))
             elif et == "message.updated":
                 info = pr.get("info") or {}
                 if info.get("role") == "assistant":
@@ -851,14 +864,27 @@ class Handler(BaseHTTPRequestHandler):
                     chunk({"tool_calls": wire})
                     got_any = True
                 elif full:
+                    sent = "".join(content_sent)
+                    remain = full
+                    if sent:
+                        if full.startswith(sent):
+                            remain = full[len(sent):]
+                        else:
+                            idx = full.find(sent)
+                            if idx >= 0:
+                                # delta 可能丢首字符：补开头缺失段 + 尾部剩余
+                                remain = full[:idx] + full[idx + len(sent):]
+                            else:
+                                # 对不齐时宁可不补，避免重复输出
+                                remain = ""
                     step = 60
-                    for i in range(0, len(full), step):
-                        if not chunk({"content": full[i:i + step]}):
+                    for i in range(0, len(remain), step):
+                        if not chunk({"content": remain[i:i + step]}):
                             break
                     got_any = True
-                elif delta_acc:
+                elif delta_acc and not content_sent:
                     # sender 没拿到正文（超时/上游异常）时，用已收到的增量兜底，
-                    # 至少不要让客户端只看到半截就断掉。
+                    # 至少不要让客户端只看到半截就断掉。正文已实时发过则不重复。
                     full = "".join(delta_acc)
                     step = 60
                     for i in range(0, len(full), step):
@@ -871,7 +897,7 @@ class Handler(BaseHTTPRequestHandler):
         if holder.get("err"):
             log("%s 流式失败 %s (%.1fs)" % (model, holder["err"][:60], el))
             _stat_error()
-            if delta_acc and not got_any:
+            if delta_acc and not got_any and not content_sent:
                 dtext = "".join(delta_acc)
                 for i in range(0, len(dtext), 60):
                     if not chunk({"content": dtext[i:i + 60]}):
