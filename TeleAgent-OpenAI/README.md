@@ -274,23 +274,6 @@ v2.4 改成和 `teleagent-openai-proxy` 同一套异步架构：
 | 保活 | 8 秒没有事件就发一个零宽空格 `content` 帧，保证客户端侧「有活动」 |
 | 兜底 | 150 秒无任何事件、或总时长超 1800 秒，主动收尾，避免无限挂起 |
 
-### 节点模式：直连平台（teleagent2api，默认）
-
-4397 是完整的 opencode agent：模型会自己 `read` / `powershell` / `skill`，工具调用不经过 OpenAI
-协议，客户端只能看到「说到一半就结束」，而且它读的是节点机的临时目录，和用户的工程完全脱节。
-节点改成 teleagent2api 直连平台 chat 接口后没有 agent，工具调用只走网关的 JSON 桥。
-
-节点 exe 全自动完成以下事情，**不需要在控制台手动加账号**：
-
-1. 从 `%USERPROFILE%\.local\share\TeleAgent\` 读取并解密账号凭证
-   （DPAPI 解 os_crypt 主密钥 + AES-256-GCM 解 v10 token，与客户端同一条解密路径）
-2. 注入 `TELEAGENT_TOKEN` / `TELEAGENT_DEVICE_ID` / `TELEAGENT_INSTALL_ID` 启动 teleagent2api；
-   启动前删除旧账号文件，保证每次都用最新 token 重新播种
-3. 上游监听 `127.0.0.1:10000`，`timeout=1800s`，`reasoningMode=reasoning_content`
-4. 每 30 分钟重读一次凭证，token 变了自动重启上游（JWT 过期也能自愈）
-
-部署只需要把 `TeleAgentNode.exe` 和 `teleagent2api.exe` 放在同一目录。
-
 ---
 
 ## 六、工作原理 / 注意事项
