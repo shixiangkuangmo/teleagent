@@ -56,7 +56,7 @@ MAX_BODY_BYTES = int(os.environ.get("TG_MAX_BODY", str(8 * 1024 * 1024)))
 API_KEY = os.environ.get("TG_API_KEY", "").strip()
 
 # 运行统计与探活缓存：/pool/status 供节点代理采集，/health 只读缓存绝不阻塞。
-GATEWAY_VERSION = "2.3.0"
+GATEWAY_VERSION = "2.3.1"
 STARTED_AT = time.time()
 TG_NODE_NAME = os.environ.get("TG_NODE_NAME", "").strip()
 
@@ -251,8 +251,8 @@ def trim_messages(messages, max_chars):
     """按消息维度裁剪：保留全部 system，从最近往前保留对话，超长的工具输出单独截断。"""
     if not isinstance(messages, list) or not messages:
         return messages, False
-    systems = [m for m in messages if m.get("role") == "system"]
-    others = [m for m in messages if m.get("role") != "system"]
+    systems = [m for m in messages if m.get("role") in ("system", "developer")]
+    others = [m for m in messages if m.get("role") not in ("system", "developer")]
 
     def clen(m):
         c = m.get("content")
@@ -331,14 +331,17 @@ def messages_to_text(messages):
                 for tc in tcs
             ], ensure_ascii=False) if tcs else ""
         if isinstance(content, str):
-            if role == "system":
+            if role in ("system", "developer"):
                 _dump_prompt("raw", content)
-                if SYSTEM_MODE == "strip":
+                # developer 是 OpenAI 新规范里的"应用/用户规则"，不是平台元话术。
+                # replace 模式下也不要整段丢弃，清洗后保留，否则用户自己的规则会失效。
+                mode = "filter" if (role == "developer" and SYSTEM_MODE == "replace") else SYSTEM_MODE
+                if mode == "strip":
                     if not sys_sent:
                         log("系统提示词已丢弃（strip 模式，%d 字符不发给上游）" % len(content))
                         sys_sent = True
                     continue
-                if SYSTEM_MODE == "replace":
+                if mode == "replace":
                     if not sys_sent:
                         log("系统提示词已替换（%d 字符 -> 内置 %d 字符）"
                             % (len(content), len(CLEAN_SYSTEM)))
@@ -369,7 +372,7 @@ def messages_to_text(messages):
                     continue
                 if meta_cut:
                     log("已剔除用户消息中的宿主元信息（%d -> %d 字符）" % (orig_len, len(content)))
-        if role == "system":
+        if role in ("system", "developer"):
             # 系统设定不加"系统:"前缀——上游会把"系统: xxx"当成伪造系统消息的注入
             # （实测：加了前缀它就回"那段以「系统:」开头的人设设定我不会采用"）
             lines.append(content)
@@ -387,15 +390,25 @@ def build_tool_prompt(tools, tool_choice):
     if tool_choice == "none":
         return ""
     specs = []
-    for t in tools if isinstance(tools, list) else []:
+    # 宿主（Trae / WorkBuddy 等）会把整篇技能文档塞进工具描述，动辄数万字。
+    # 全部透传会挤掉用户真正的问题，还会让模型把工具说明当成任务复述。
+    # 这里只保留名称、截断后的简述和参数 schema。
+    MAX_TOOLS = 32
+    MAX_DESC = 240
+    for t in (tools if isinstance(tools, list) else []):
         fn = t.get("function") if isinstance(t, dict) and t.get("type", "function") == "function" else None
         if not isinstance(fn, dict) or not fn.get("name"):
             continue
+        desc = (fn.get("description") or "").strip()
+        if len(desc) > MAX_DESC:
+            desc = desc[:MAX_DESC] + "…"
         specs.append({
             "name": fn["name"],
-            "description": fn.get("description") or "",
+            "description": desc,
             "parameters": fn.get("parameters") or {},
         })
+        if len(specs) >= MAX_TOOLS:
+            break
     if not specs:
         return ""
     force = ""
@@ -407,6 +420,7 @@ def build_tool_prompt(tools, tool_choice):
         force = "本轮必须调用至少一个工具，不要直接回答。\n"
     return (
         "\n\n[工具调用协议]\n"
+        "下面只是可用工具的定义，不是用户任务；不要复述或解释这段协议。\n"
         "你可以调用下列本机工具。需要调用时，只输出一行 JSON，"
         "不要输出解释、Markdown 或代码围栏：\n"
         '{"tool_calls":[{"name":"工具名","arguments":{"参数名":值}}]}\n'
@@ -692,10 +706,12 @@ class Handler(BaseHTTPRequestHandler):
         def sender():
             try:
                 t_send[0] = time.time()
+                # 长回复（尤其带工具/技能说明时）同步调用可能远超 5 分钟，
+                # 原来的默认 300s 会直接掐断，客户端表现为"输出到一半停住"。
                 st, raw = call_with_retry("POST", "/session/%s/message" % sid, {
                     "parts": [{"type": "text", "text": text}],
                     "model": {"providerID": "NewApi", "modelID": model},
-                })
+                }, timeout=1800)
                 holder["st"], holder["raw"] = st, raw
                 log("%s sender 完成 HTTP %s %d 字节，用时 %.2fs" % (
                     model, st, len(raw), time.time() - t_send[0]))
@@ -745,6 +761,7 @@ class Handler(BaseHTTPRequestHandler):
         got_any = False
         usage = {}
         sent_text = []
+        delta_acc = []
         first_pid = [None]
         buf_first = []
         second_seen = [False]
@@ -800,6 +817,7 @@ class Handler(BaseHTTPRequestHandler):
                 # opencode 的 delta 不带 part 类型（reasoning 与正文混在一起，且可能丢首字符），
                 # 因此一律作为 reasoning_content 转发做实时反馈；
                 # 正文在结束后用 message API 的同步结果统一发出，保证干净、无重复。
+                delta_acc.append(d)
                 if not chunk({"reasoning_content": d}):
                     break
             elif et == "message.updated":
@@ -838,12 +856,27 @@ class Handler(BaseHTTPRequestHandler):
                         if not chunk({"content": full[i:i + step]}):
                             break
                     got_any = True
+                elif delta_acc:
+                    # sender 没拿到正文（超时/上游异常）时，用已收到的增量兜底，
+                    # 至少不要让客户端只看到半截就断掉。
+                    full = "".join(delta_acc)
+                    step = 60
+                    for i in range(0, len(full), step):
+                        if not chunk({"content": full[i:i + step]}):
+                            break
+                    got_any = True
             except Exception:
                 pass
 
         if holder.get("err"):
             log("%s 流式失败 %s (%.1fs)" % (model, holder["err"][:60], el))
             _stat_error()
+            if delta_acc and not got_any:
+                dtext = "".join(delta_acc)
+                for i in range(0, len(dtext), 60):
+                    if not chunk({"content": dtext[i:i + 60]}):
+                        break
+                got_any = True
             chunk({"content": "\n[网关错误: %s]" % holder["err"][:200]}, "stop")
         elif st and st != 200:
             log("%s 流式上游 %s (%.1fs)" % (model, st, el))
