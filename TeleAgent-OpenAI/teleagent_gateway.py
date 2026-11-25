@@ -5,9 +5,10 @@ TeleAgent OpenAI 兼容网关 v2
 
 v2 相对 v1 的关键修复
 ---------------------
-1. **真流式**：订阅 4397 的 /event (SSE)，把 message.part.delta 实时转发给客户端。
-   v1 是「等上游完整回复再切块」，大请求（10万+ token）期间客户端零字节可收，
-   会被判超时断连（WinError 10053）——这就是「卡死」的根因。
+1. **真流式**：prompt_async 异步提交 + 订阅 4397 的 /global/event (SSE)，
+   把 message.part.delta 实时转发给客户端。v1 是「等上游完整回复再切块」，
+   大请求（10万+ token）期间客户端零字节可收，会被判超时断连（WinError 10053）
+   ——这就是「卡死」的根因。
 2. **首字节探活**：流式连接建立后立刻发 role chunk，客户端立即收到响应头，不再干等。
 3. **心跳保活**：等待上游期间每 3 秒发一个 SSE 注释行 `: keepalive`，防中间层超时。
 4. **请求日志**：记录每个请求的耗时/token/状态，便于排查卡顿。
@@ -35,7 +36,7 @@ except Exception:
     pass
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from teleagent_client import Client, _headers, BASE as UPSTREAM  # noqa: E402
+from teleagent_client import Client, _headers, BASE as UPSTREAM, SESSION_DIR  # noqa: E402
 from tg_sanitize import sanitize_system, sanitize_any, residual_hits, suspicion_scan  # noqa: E402
 
 DEFAULT_MODELS = ["chat-flagship", "chat-pro", "chat-flash", "chat-lite", "chat-nano"]
@@ -56,7 +57,7 @@ MAX_BODY_BYTES = int(os.environ.get("TG_MAX_BODY", str(8 * 1024 * 1024)))
 API_KEY = os.environ.get("TG_API_KEY", "").strip()
 
 # 运行统计与探活缓存：/pool/status 供节点代理采集，/health 只读缓存绝不阻塞。
-GATEWAY_VERSION = "2.3.1"
+GATEWAY_VERSION = "2.4.0"
 STARTED_AT = time.time()
 TG_NODE_NAME = os.environ.get("TG_NODE_NAME", "").strip()
 
@@ -671,59 +672,51 @@ class Handler(BaseHTTPRequestHandler):
                       "total_tokens": pi + po},
         })
 
-    # ── 真流式：订阅 /event 转发 delta ──
+    # ── 真流式：prompt_async 异步提交 + /global/event 实时取增量 ──
     def _do_stream(self, sid, model, text, want_usage, t_req):
+        c = get_client()
         q = queue.Queue()
         stop = threading.Event()
 
+        def open_stream(path):
+            h = _headers(c.key, "GET", path)
+            h["Accept"] = "text/event-stream"
+            req = urllib.request.Request(UPSTREAM + path, headers=h)
+            return urllib.request.urlopen(req, timeout=1800)
+
         def listener():
             try:
-                c = get_client()
-                h = _headers(c.key, "GET", "/event")
-                h["Accept"] = "text/event-stream"
-                req = urllib.request.Request(UPSTREAM + "/event", headers=h)
-                with urllib.request.urlopen(req, timeout=1800) as r:
+                try:
+                    r = open_stream("/global/event")
+                except Exception as e1:
+                    log("订阅 /global/event 失败(%s)，回退 /event" % e1)
+                    r = open_stream("/event")
+                with r:
                     while not stop.is_set():
                         line = r.readline()
                         if not line:
                             break
-                        if line.startswith(b"data: "):
-                            try:
-                                q.put(json.loads(line[6:]))
-                            except Exception:
-                                pass
+                        if not line.startswith(b"data:"):
+                            continue
+                        try:
+                            ev = json.loads(line[5:].strip())
+                        except Exception:
+                            continue
+                        # /global/event 外层是 {"payload": {...}}；/event 直接给事件本身
+                        payload = ev.get("payload")
+                        q.put(payload if isinstance(payload, dict) else ev)
             except Exception as e:
                 q.put({"_error": str(e)})
 
-        # 先监听，再发消息（否则前面的 delta 会漏）
+        # 先订阅，再提交消息：否则最前面的增量会漏
         threading.Thread(target=listener, daemon=True).start()
-        time.sleep(0.35)
+        time.sleep(0.25)
 
-        holder = {}
-
-        t_send = [None]
-
-        def sender():
-            try:
-                t_send[0] = time.time()
-                # 长回复（尤其带工具/技能说明时）同步调用可能远超 5 分钟，
-                # 原来的默认 300s 会直接掐断，客户端表现为"输出到一半停住"。
-                st, raw = call_with_retry("POST", "/session/%s/message" % sid, {
-                    "parts": [{"type": "text", "text": text}],
-                    "model": {"providerID": "NewApi", "modelID": model},
-                }, timeout=1800)
-                holder["st"], holder["raw"] = st, raw
-                log("%s sender 完成 HTTP %s %d 字节，用时 %.2fs" % (
-                    model, st, len(raw), time.time() - t_send[0]))
-            except Exception as e:
-                holder["err"] = str(e)
-
-        threading.Thread(target=sender, daemon=True).start()
-
-        # 立刻回响应头 + role chunk，客户端马上就有反馈
         cid = "chatcmpl-%s" % sid
-        log("%s 流式开始 (prompt≈%d 字符)" % (model, len(text)))
         created = int(time.time())
+        log("%s 流式开始 (prompt≈%d 字符)" % (model, len(text)))
+
+        # 立刻回响应头 + role chunk，客户端马上有反馈
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -754,182 +747,165 @@ class Handler(BaseHTTPRequestHandler):
                          "model": model,
                          "choices": [{"index": 0, "delta": delta, "finish_reason": fin}]})
 
+        def send_tail(u):
+            u = u or {}
+            if want_usage and u:
+                emit({"id": cid, "object": "chat.completion.chunk", "created": created,
+                      "model": model, "choices": [],
+                      "usage": {"prompt_tokens": u.get("input", 0),
+                                "completion_tokens": u.get("output", 0),
+                                "total_tokens": u.get("input", 0) + u.get("output", 0)}})
+            try:
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            except Exception:
+                pass
+            # 收尾关连接：有些客户端读到 EOF 才认为流结束，挂着 keep-alive 会让它干等
+            try:
+                self.close_connection = True
+            except Exception:
+                pass
+            if u:
+                _stat_add_tokens(u.get("input", 0), u.get("output", 0))
+
         chunk({"role": "assistant"})
 
+        # 异步提交：上游立刻返回 204，正文全部靠事件流推过来。原来那条同步
+        # /session/{sid}/message 一挂就是几十分钟，期间没有任何正文增量，
+        # 客户端判 idle 直接断流——这就是「思考到一半停住」的根因。
+        try:
+            st, raw = c.call("POST", "/session/%s/prompt_async" % sid, {
+                "sessionID": sid,
+                "parts": [{"type": "text", "text": text}],
+                "directory": SESSION_DIR,
+                "model": {"providerID": "NewApi", "modelID": model},
+            }, timeout=15)
+        except Exception as e:
+            st, raw = None, str(e).encode()
+
+        if st not in (200, 204):
+            detail = raw[:300].decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+            log("%s prompt_async 失败 HTTP %s %s" % (model, st, detail))
+            _stat_error()
+            chunk({"content": "\n[上游 %s: %s]" % (st, detail)}, "stop")
+            send_tail({})
+            return
+
+        text_pids = set()
+        msg_ids = set()
+        content_acc = []
+        usage = {}
+        got_any = False
+        error_msg = ""
         first_token_at = [None]
         last_beat = time.time()
-        got_any = False
-        usage = {}
-        sent_text = []
-        delta_acc = []
-        content_sent = []
-        text_pids = set()
-        first_pid = [None]
-        buf_first = []
-        second_seen = [False]
-        drained_at = [None]
+        last_ev = time.time()
 
         while True:
-            # 上游已完成：再给事件流 2 秒排空剩余 delta（否则会截断）
-            if "raw" in holder or "err" in holder:
-                if drained_at[0] is None:
-                    drained_at[0] = time.time()
-                elif time.time() - drained_at[0] > 2.0 and q.empty():
-                    break
             try:
                 ev = q.get(timeout=0.3)
             except queue.Empty:
                 ev = None
 
             if ev is None:
-                # 心跳保活：Trae 的 stream_idle_timeout 只认 data: 帧，SSE 注释行
-                # 会被当成静默，所以发一个带零宽空格的合法 content 增量，
-                # 客户端视为有输出进度，但正文里不可见。
-                if time.time() - last_beat >= 8.0:
+                now = time.time()
+                # Trae 的 stream_idle_timeout 只认 data: 帧，SSE 注释行算静默，
+                # 所以用零宽空格 content 做心跳：客户端视为有进度，正文不可见。
+                if now - last_beat >= 8.0:
                     if not chunk({"content": "\u200b"}):
                         break
-                    last_beat = time.time()
+                    last_beat = now
+                if now - t_req > 1800:
+                    error_msg = "总超时"
+                    log("%s 流式总超时" % model)
+                    break
+                if now - last_ev > 150:
+                    log("%s 事件流 %.0fs 无事件，判定结束" % (model, now - last_ev))
+                    break
                 continue
 
             if "_error" in ev:
-                log("事件流错误: %s" % ev["_error"])
+                error_msg = str(ev["_error"])
+                log("事件流错误: %s" % error_msg)
                 break
 
+            last_ev = time.time()
             et = ev.get("type")
             pr = ev.get("properties") or {}
-            if pr.get("sessionID") != sid:
+            ssid = pr.get("sessionID")
+            if ssid and ssid != sid:
                 continue
 
-            # message.part.delta 不带 part 类型，但按 partID 分组推送。
-            # 实测规律：reasoning 的 part 先出现，答案(text) 的 part 后出现。
-            # 策略：跳过第一个 partID（通常是 reasoning），此后只转发新 partID 的 delta。
-            # 完整内容在循环结束后用 message API 的同步结果兜底补齐。
-            if et == "message.part.delta":
-                pid2 = pr.get("partID")
-                if pid2 is None:
-                    continue
+            if et == "message.updated":
+                info = pr.get("info") or {}
+                if info.get("role") == "assistant":
+                    if info.get("id"):
+                        msg_ids.add(info["id"])
+                    tk = info.get("tokens") or {}
+                    if tk:
+                        usage = tk
+                    if info.get("error") or info.get("finish") == "error":
+                        error_msg = "上游返回错误"
+                    if (info.get("time") or {}).get("completed"):
+                        break
+            elif et == "message.part.updated":
+                part = pr.get("part") or {}
+                ptype = part.get("type")
+                if ptype == "text" and part.get("id"):
+                    mid = part.get("messageID") or pr.get("messageID")
+                    if not msg_ids or mid in msg_ids:
+                        text_pids.add(part["id"])
+                elif ptype == "step-finish":
+                    tk = part.get("tokens") or {}
+                    if tk and not usage:
+                        usage = tk
+                if part.get("error"):
+                    error_msg = "上游返回错误"
+            elif et == "message.part.delta":
+                pid = pr.get("partID")
                 d = pr.get("delta") or ""
                 if not d:
                     continue
                 if first_token_at[0] is None:
                     first_token_at[0] = time.time() - t_req
                     log("%s 首字 %.1fs" % (model, first_token_at[0]))
-                delta_acc.append(d)
-                last_beat = time.time()
-                # properties.field == "text" 是正文增量（与 openai_proxy 的做法一致），
-                # 其余是思考。正文必须实时发送：只发 reasoning_content 时 Trae 收不到
-                # content，会判定 stream_idle_timeout 直接掐断。
-                # sender 返回完整文本后再按已发内容补齐差异，避免重复。
-                is_text = (pr.get("field") == "text") or (pid2 in text_pids)
-                if is_text:
-                    content_sent.append(d)
+                last_beat = last_ev
+                # field == "text" 是正文增量；已登记为 text 的 part 也按正文。
+                # 正文必须实时发：只发 reasoning_content 时客户端判 idle 断流。
+                if pr.get("field") == "text" or pid in text_pids:
+                    content_acc.append(d)
                     if not chunk({"content": d}):
                         break
                 else:
                     if not chunk({"reasoning_content": d}):
                         break
-            elif et == "message.part.updated":
-                # 记录正文 part 的 id，delta 没带 field 时用它兜底判断
-                part = pr.get("part") or {}
-                if part.get("type") == "text" and part.get("id"):
-                    text_pids.add(part.get("id"))
-            elif et == "message.updated":
-                info = pr.get("info") or {}
-                if info.get("role") == "assistant":
-                    tk = info.get("tokens") or {}
-                    if tk:
-                        usage = tk
+            elif et == "session.status":
+                status = pr.get("status") or {}
+                if status.get("type") == "idle":
+                    break
 
         stop.set()
-
         el = time.time() - t_req
-        st = holder.get("st")
 
-        # 正文一律以 message API 的同步结果为准（delta 只承担 reasoning 实时展示）
-        finish_reason = "stop"
-        if not holder.get("err") and st == 200:
-            try:
-                j = json.loads(holder["raw"])
-                data = j.get("data") or {}
-                parts = data.get("parts") or []
-                full = "".join(p.get("text", "") for p in parts if p.get("type") == "text")
-                if not usage:
-                    usage = (data.get("info") or {}).get("tokens") or {}
-                calls = parse_tool_calls(full)
-                if calls:
-                    wire = _openai_tool_calls(calls)
-                    for i, tc in enumerate(wire):
-                        tc["index"] = i
-                    finish_reason = "tool_calls"
-                    chunk({"tool_calls": wire})
-                    got_any = True
-                elif full:
-                    sent = "".join(content_sent)
-                    remain = full
-                    if sent:
-                        if full.startswith(sent):
-                            remain = full[len(sent):]
-                        else:
-                            idx = full.find(sent)
-                            if idx >= 0:
-                                # delta 可能丢首字符：补开头缺失段 + 尾部剩余
-                                remain = full[:idx] + full[idx + len(sent):]
-                            else:
-                                # 对不齐时宁可不补，避免重复输出
-                                remain = ""
-                    step = 60
-                    for i in range(0, len(remain), step):
-                        if not chunk({"content": remain[i:i + step]}):
-                            break
-                    got_any = True
-                elif delta_acc and not content_sent:
-                    # sender 没拿到正文（超时/上游异常）时，用已收到的增量兜底，
-                    # 至少不要让客户端只看到半截就断掉。正文已实时发过则不重复。
-                    full = "".join(delta_acc)
-                    step = 60
-                    for i in range(0, len(full), step):
-                        if not chunk({"content": full[i:i + step]}):
-                            break
-                    got_any = True
-            except Exception:
-                pass
-
-        if holder.get("err"):
-            log("%s 流式失败 %s (%.1fs)" % (model, holder["err"][:60], el))
-            _stat_error()
-            if delta_acc and not got_any and not content_sent:
-                dtext = "".join(delta_acc)
-                for i in range(0, len(dtext), 60):
-                    if not chunk({"content": dtext[i:i + 60]}):
-                        break
-                got_any = True
-            chunk({"content": "\n[网关错误: %s]" % holder["err"][:200]}, "stop")
-        elif st and st != 200:
-            log("%s 流式上游 %s (%.1fs)" % (model, st, el))
-            _stat_error()
-            chunk({"content": "\n[上游 %s: %s]" % (st, holder.get("raw", b"")[:200].decode("utf-8", "replace"))}, "stop")
+        full = "".join(content_acc)
+        calls = parse_tool_calls(full) if full else None
+        if calls:
+            wire = _openai_tool_calls(calls)
+            for i, tc in enumerate(wire):
+                tc["index"] = i
+            chunk({"tool_calls": wire})
+            chunk({}, "tool_calls")
+            got_any = True
+        elif error_msg:
+            chunk({"content": "\n[网关错误: %s]" % error_msg}, "stop")
         else:
-            chunk({}, finish_reason)
+            chunk({}, "stop")
+            if full:
+                got_any = True
 
-        if want_usage and usage:
-            emit({"id": cid, "object": "chat.completion.chunk", "created": created,
-                  "model": model, "choices": [],
-                  "usage": {"prompt_tokens": usage.get("input", 0),
-                            "completion_tokens": usage.get("output", 0),
-                            "total_tokens": usage.get("input", 0) + usage.get("output", 0)}})
-
-        try:
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
-        except Exception:
-            pass
-        # 收尾关连接：有些客户端读到 EOF 才认为流结束，挂着 keep-alive 会让它干等
-        try:
-            self.close_connection = True
-        except Exception:
-            pass
-
-        _stat_add_tokens(usage.get("input", 0), usage.get("output", 0))
+        send_tail(usage)
+        if error_msg:
+            _stat_error()
         log("%s 流式完成 in=%s out=%s 首字=%s 总耗时=%.1fs%s" % (
             model, usage.get("input", 0), usage.get("output", 0),
             ("%.1fs" % first_token_at[0]) if first_token_at[0] else "无",

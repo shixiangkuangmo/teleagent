@@ -206,7 +206,7 @@ v1 有个致命问题：**大请求会「卡死」**。DSH 里表现为一直转
 | 响应头迟迟不来 | 启动时预提取 key；并加**本地 key 缓存** `.session_key`，重启后 0 秒命中 |
 | 等待期间零字节 | 每 3 秒发 SSE 注释行 `: keepalive` 保活 |
 | 客户端以为卡死 | 连上立刻回响应头 + `role` chunk |
-| 流式内容错乱 | `message.part.delta` **不带 part 类型**，reasoning 与正文混在一起，还可能丢首字符。因此 delta 一律走 `reasoning_content` 做实时反馈；**正文以 `message` API 的同步结果为准**，结束后分块发出 |
+| 流式内容错乱 | v2 先用 `reasoning_content` 做实时反馈、正文等同步结果；v2.4 起改为真流式（见下一节），正文按 `message.part.delta` 实时转发 |
 
 ### 实测效果（v2）
 
@@ -255,15 +255,24 @@ DSH 会**把完整对话历史（含大量工具调用输出）每轮全量发�
 **代价**：中间历史会被丢弃，超长对话的上下文连贯性会下降。
 想放宽就调大：`set TG_MAX_PROMPT=80000`（上游可能重新超时，自行权衡）。
 
-### 取舍说明
+### v2.4：正文真流式（prompt_async + /global/event）
 
-因为 opencode 的 delta 事件不区分 reasoning 和正文，**正文无法做到逐字流式**，
-只能在模型生成完成后分块发出。所以：
+v2 之前的结构性问题是：流式请求靠一条**同步**的 `POST /session/{sid}/message` 拿结果，
+这条请求要挂到上游生成完毕才返回，中间只有 reasoning 增量能发，正文一个字节都没有。
+客户端（Trae / DSH）的 `stream_idle_timeout` 只把有效的 `data:` 内容增量算作活动，
+注释行心跳不计入，于是「思考到一半 → 长时间无反应 → 直接断开」。
 
-- **短请求**（几秒）：体验接近流式
-- **超长请求**（十几万 token）：reasoning 会先实时流出，正文要等生成完才出现
+v2.4 改成和 `teleagent-openai-proxy` 同一套异步架构：
 
-这是当前接口能力下的最优解——换取**内容 100% 正确 + 连接不断**。
+| 步骤 | 做法 |
+|---|---|
+| 提交 | `POST /session/{sid}/prompt_async`，上游立刻返回 204，不再有长挂起的 HTTP 请求 |
+| 取流 | 订阅 4397 的 `GET /global/event`（SSE），逐条读事件；没有该端点时回退 `/event` |
+| 正文 | `message.part.delta` 中 `field == "text"`（或 part 已登记为 text）→ 实时 `delta.content` |
+| 推理 | 其余增量 → `delta.reasoning_content` |
+| 结束 | 收到 `session.status` 的 `idle`（或 `message.updated` 带 `time.completed`）即收尾 |
+| 保活 | 8 秒没有事件就发一个零宽空格 `content` 帧，保证客户端侧「有活动」 |
+| 兜底 | 150 秒无任何事件、或总时长超 1800 秒，主动收尾，避免无限挂起 |
 
 ---
 
@@ -289,7 +298,7 @@ signature = base64url(HMAC_SHA256(sessionKey, payload))
 - TeleAgent 有单实例锁，不能多开
 - 服务端有内容审核（`security/instruction/review`），敏感内容会被拦
 - 额度是 TeleAgent 账号的，不是你自己的 API key，天道可能变化（政策/风控）
-- 网关的 stream 是**半流式**：reasoning 实时流出，正文要等上游生成完成后分块发出（接口不区分 reasoning/正文，见「五点五、v2 修复记录」）
+- 网关的 stream 自 v2.4 起是**真流式**：正文随 `message.part.delta` 逐帧转发（见「五点五、v2.4」）
 - 支持 `tools / tool_choice / response_format`，但走的是**提示词 JSON 协议桥接**，不是上游原生 function calling，模型偶尔可能不按协议输出（此时按普通文本返回）
 
 ---
