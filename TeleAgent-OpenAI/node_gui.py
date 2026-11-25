@@ -3,12 +3,7 @@
 node_gui.py — TeleAgent 节点图形界面
 ====================================
 一个窗口完成配置：填写面板地址与节点凭据，点「启动」后同时运行
-本机上游网关与池代理（pool_agent）。
-
-上游两种方式：
-  1. teleagent2api（推荐）——自动拉起同目录的 teleagent2api.exe，Go 单跳直连
-     TeleAgent 平台 API，不依赖 4397 客户端，流式输出不会中途断流；
-  2. 内置网关 —— 运行 teleagent_gateway，需要本机 TeleAgent 客户端（4397）。
+本机 OpenAI 网关（teleagent_gateway）和池代理（pool_agent）。
 
 可打包成单个 exe（见 build-exe.bat），目标机器无需安装 Python。
 
@@ -19,9 +14,7 @@ import importlib
 import json
 import os
 import queue
-import secrets
 import socket
-import subprocess
 import sys
 import threading
 import time
@@ -37,16 +30,10 @@ from tkinter import messagebox, scrolledtext, ttk
 import pool_agent
 
 APP_NAME = "TeleAgent 节点"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.0.0"
 CONFIG_NAME = "pool-agent.json"
 TEXT_ROWS = ("server", "node_id", "token", "name", "max_inflight",
-             "gateway_url", "gateway_key", "max_prompt",
-             "t2a_port", "t2a_admin_password")
-
-# 上游两种形态：teleagent2api（Go 单跳直连平台，推荐）与内置网关（依赖 4397 客户端）
-MODE_T2A_LABEL = "teleagent2api（直连平台，推荐）"
-MODE_GW_LABEL = "内置网关（TeleAgent 客户端 4397）"
-MODE_LABELS = {"teleagent2api": MODE_T2A_LABEL, "gateway": MODE_GW_LABEL}
+             "gateway_url", "gateway_key", "max_prompt")
 
 
 def app_dir():
@@ -79,14 +66,10 @@ def default_config():
         "token": "",
         "name": socket.gethostname(),
         "max_inflight": 4,
-        "upstream_mode": "teleagent2api",
-        "gateway_url": "http://127.0.0.1:10000",
+        "gateway_url": "http://127.0.0.1:8899",
         "gateway_key": "",
         "auto_gateway": True,
         "max_prompt": 40000,
-        "t2a_port": 10000,
-        "t2a_admin_password": "",
-        "t2a_exe": "",
         "insecure": False,
     }
 
@@ -128,7 +111,6 @@ class App:
         self.agent = None
         self.gateway_srv = None
         self.gateway_mod = None
-        self.t2a_proc = None
         self.running = False
         self.vars = {}
 
@@ -139,13 +121,12 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._log("配置文件：%s" % self.cfg_path)
         self._log("填好面板地址、节点 ID 和 Token 后点「启动」。")
-        self._log("默认上游 teleagent2api：请把 teleagent2api.exe 放在本程序同一目录。")
 
     # ───────────────────── 界面 ─────────────────────
     def _build_ui(self):
         self.root.title("%s v%s" % (APP_NAME, APP_VERSION))
-        self.root.geometry("800x720")
-        self.root.minsize(720, 620)
+        self.root.geometry("780x660")
+        self.root.minsize(700, 560)
 
         outer = ttk.Frame(self.root, padding=10)
         outer.pack(fill="both", expand=True)
@@ -161,34 +142,20 @@ class App:
         self._row(box1, 3, "节点名称", "name", "显示在面板里的名字")
         self._row(box1, 4, "最大并发", "max_inflight", "同时处理的请求数，默认 4")
 
-        # 上游网关
-        box2 = ttk.LabelFrame(outer, text=" 上游网关 ", padding=10)
+        # 本地网关
+        box2 = ttk.LabelFrame(outer, text=" 本地网关 ", padding=10)
         box2.pack(fill="x", pady=(10, 0))
         box2.columnconfigure(1, weight=1)
 
-        ttk.Label(box2, text="上游方式").grid(row=0, column=0, sticky="e", padx=(0, 8), pady=3)
-        self.var_mode = tk.StringVar(
-            value=MODE_LABELS.get(str(self.cfg.get("upstream_mode") or "teleagent2api"),
-                                  MODE_T2A_LABEL))
-        self.cmb_mode = ttk.Combobox(box2, textvariable=self.var_mode, state="readonly",
-                                     values=(MODE_T2A_LABEL, MODE_GW_LABEL))
-        self.cmb_mode.grid(row=0, column=1, sticky="ew", pady=3)
-        self.cmb_mode.bind("<<ComboboxSelected>>", self._on_mode_change)
-        ttk.Label(box2, text="直连平台更稳；内置网关需要 TeleAgent 客户端在运行",
-                  foreground="#888").grid(row=0, column=2, sticky="w", padx=(8, 0), pady=3)
-
-        self._row(box2, 1, "网关地址", "gateway_url", "teleagent2api 默认 http://127.0.0.1:10000")
-        self._row(box2, 2, "网关 API Key", "gateway_key",
-                  "节点→本机网关的密钥；留空自动生成", show="*")
-        self._row(box2, 3, "网关端口", "t2a_port", "teleagent2api 监听端口，默认 10000")
-        self._row(box2, 4, "控制台密码", "t2a_admin_password",
-                  "登录 http://127.0.0.1:10000/ui 添加账号用，建议设置", show="*")
-        self._row(box2, 5, "Prompt 上限", "max_prompt", "字符数，默认 40000（仅内置网关生效）")
+        self._row(box2, 0, "网关地址", "gateway_url", "http://127.0.0.1:8899")
+        self._row(box2, 1, "网关 API Key", "gateway_key",
+                  "即 TG_API_KEY；面板转发到本机网关时使用，可留空", show="*")
+        self._row(box2, 2, "Prompt 上限", "max_prompt", "字符数，默认 40000")
 
         opts = ttk.Frame(box2)
-        opts.grid(row=6, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        opts.grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
         self.vars["auto_gateway"] = tk.BooleanVar(value=bool(self.cfg.get("auto_gateway", True)))
-        self.chk_auto = ttk.Checkbutton(opts, text="自动启动本地网关（仅内置网关方式）",
+        self.chk_auto = ttk.Checkbutton(opts, text="自动启动本地网关（TeleAgent 客户端需已运行）",
                                         variable=self.vars["auto_gateway"])
         self.chk_auto.pack(side="left")
         self.vars["insecure"] = tk.BooleanVar(value=bool(self.cfg.get("insecure", False)))
@@ -203,13 +170,11 @@ class App:
         self.btn_start = ttk.Button(bar, text="启动", command=self._start)
         self.btn_stop = ttk.Button(bar, text="停止", command=self._stop, state="disabled")
         self.btn_test = ttk.Button(bar, text="测试网关", command=self._test_gateway)
-        self.btn_console = ttk.Button(bar, text="打开上游控制台", command=self._open_console)
         self.btn_clear = ttk.Button(bar, text="清空日志", command=self._clear_log)
         self.btn_save.pack(side="left")
         self.btn_start.pack(side="left", padx=(8, 0))
         self.btn_stop.pack(side="left", padx=(8, 0))
         self.btn_test.pack(side="left", padx=(8, 0))
-        self.btn_console.pack(side="left", padx=(8, 0))
         self.btn_clear.pack(side="right")
 
         self.link_gh = tk.Label(bar, text="★ GitHub 项目主页", fg="#2563eb", cursor="hand2")
@@ -245,28 +210,6 @@ class App:
         sys.stderr = w
 
     # ───────────────────── 配置 ─────────────────────
-    def _mode(self):
-        return "gateway" if self.var_mode.get() == MODE_GW_LABEL else "teleagent2api"
-
-    def _on_mode_change(self, _evt=None):
-        port = self._int(self.vars["t2a_port"].get(), 10000)
-        cur = self.vars["gateway_url"].get().strip()
-        if self._mode() == "teleagent2api":
-            if not cur or "8899" in cur or ":10000" in cur:
-                self.vars["gateway_url"].set("http://127.0.0.1:%d" % port)
-            self._log("上游方式：teleagent2api（启动时自动拉起 teleagent2api.exe）")
-        else:
-            if not cur or ":10000" in cur:
-                self.vars["gateway_url"].set("http://127.0.0.1:8899")
-            self._log("上游方式：内置网关（需要 TeleAgent 客户端在运行）")
-
-    @staticmethod
-    def _int(value, default):
-        try:
-            return int(float(str(value).strip()))
-        except Exception:
-            return default
-
     def _collect(self):
         def txt(k):
             return self.vars[k].get().strip()
@@ -278,25 +221,16 @@ class App:
                 v = default
             return max(lo, min(hi, v))
 
-        mode = self._mode()
-        port = num("t2a_port", 10000, 1, 65535)
-        gw_url = txt("gateway_url")
-        if mode == "teleagent2api" and (not gw_url or gw_url == "http://127.0.0.1:8899"):
-            gw_url = "http://127.0.0.1:%d" % port
         cfg = {
             "server": txt("server"),
             "node_id": txt("node_id"),
             "token": txt("token"),
             "name": txt("name") or socket.gethostname(),
             "max_inflight": num("max_inflight", 4, 1, 64),
-            "upstream_mode": mode,
-            "gateway_url": gw_url or "http://127.0.0.1:8899",
+            "gateway_url": txt("gateway_url") or "http://127.0.0.1:8899",
             "gateway_key": txt("gateway_key"),
             "auto_gateway": bool(self.vars["auto_gateway"].get()),
             "max_prompt": num("max_prompt", 40000, 1000, 5000000),
-            "t2a_port": port,
-            "t2a_admin_password": txt("t2a_admin_password"),
-            "t2a_exe": self.cfg.get("t2a_exe", ""),
             "insecure": bool(self.vars["insecure"].get()),
         }
         missing = [n for n, k in (("服务器地址", "server"), ("节点 ID", "node_id"),
@@ -338,17 +272,15 @@ class App:
         except ValueError as e:
             messagebox.showerror(APP_NAME, str(e))
             return
-        self.cfg = cfg
-        if cfg["upstream_mode"] == "teleagent2api":
-            if not self._start_t2a(cfg):
-                return
-        elif cfg["auto_gateway"]:
-            if not self._start_gateway(cfg):
-                return
         try:
             self._write_config(cfg)
         except OSError as e:
             self._log("保存配置失败（不影响本次运行）：%s" % e)
+        self.cfg = cfg
+
+        if cfg["auto_gateway"]:
+            if not self._start_gateway(cfg):
+                return
         self._start_agent(cfg)
         self.running = True
         self._set_controls(False)
@@ -384,141 +316,6 @@ class App:
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         self._log("本地网关已启动：http://127.0.0.1:%d/v1" % port)
         return True
-
-    # ───────────────── teleagent2api 子进程 ─────────────────
-    def _start_t2a(self, cfg):
-        """拉起同目录的 teleagent2api.exe，并等它健康检查通过。"""
-        exe = cfg.get("t2a_exe") or os.path.join(app_dir(), "teleagent2api.exe")
-        if not os.path.isfile(exe):
-            messagebox.showerror(
-                APP_NAME,
-                "找不到 teleagent2api.exe：\n%s\n\n"
-                "请把它和本程序放在同一目录；或改用「内置网关」上游方式。" % exe)
-            return False
-        port = cfg["t2a_port"]
-        if self._port_open(port):
-            self._log("端口 %d 已有服务在监听，直接复用（不再重复启动）。" % port)
-            return True
-
-        key = cfg.get("gateway_key") or ""
-        if not key:
-            key = "sk-t2a-" + secrets.token_hex(12)
-            self.vars["gateway_key"].set(key)
-            cfg["gateway_key"] = key
-            self._log("已自动生成网关 API Key（面板外无需配置）")
-
-        data_dir = os.path.dirname(self.cfg_path) or app_dir()
-        conf_path = os.path.join(data_dir, "teleagent2api-config.json")
-        conf = {
-            "listen": "127.0.0.1:%d" % port,
-            "apiKey": key,
-            "timeout": "1800s",
-            "reasoningMode": "reasoning_content",
-            "logLevel": "info",
-            "logFormat": "text",
-            "retryCount": 1,
-        }
-        try:
-            with open(conf_path, "w", encoding="utf-8") as f:
-                json.dump(conf, f, ensure_ascii=False, indent=2)
-        except OSError as e:
-            messagebox.showerror(APP_NAME, "写 teleagent2api 配置失败：%s" % e)
-            return False
-
-        env = dict(os.environ)
-        env["TELEAGENT_CONFIG"] = conf_path
-        admin = cfg.get("t2a_admin_password") or ""
-        if not admin:
-            admin = secrets.token_hex(6)
-            self.vars["t2a_admin_password"].set(admin)
-            cfg["t2a_admin_password"] = admin
-            self._log("已自动生成控制台密码：%s（登录 /ui 添加账号用）" % admin)
-        env["ADMIN_PASSWORD"] = admin
-
-        log_path = os.path.join(data_dir, "teleagent2api.log")
-        try:
-            logf = open(log_path, "ab", buffering=0)
-        except OSError:
-            logf = subprocess.DEVNULL
-        creation = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW
-        try:
-            self.t2a_proc = subprocess.Popen(
-                [exe], cwd=data_dir, env=env, stdin=subprocess.DEVNULL,
-                stdout=logf, stderr=subprocess.STDOUT, creationflags=creation)
-        except OSError as e:
-            messagebox.showerror(APP_NAME, "启动 teleagent2api 失败：%s" % e)
-            return False
-        self._log("teleagent2api 已启动（PID %d，端口 %d）"
-                  % (self.t2a_proc.pid, port))
-
-        if not self._wait_health(port, 25):
-            self._log("teleagent2api 健康检查失败，日志末尾（%s）：" % log_path)
-            for line in self._tail(log_path, 20):
-                self._log("  " + line)
-            self._stop_t2a()
-            messagebox.showerror(APP_NAME,
-                                 "teleagent2api 没能正常启动，详情见运行日志。")
-            return False
-        self._log("teleagent2api 就绪：http://127.0.0.1:%d/ui（首次请在此添加账号）" % port)
-        return True
-
-    def _stop_t2a(self):
-        p = self.t2a_proc
-        self.t2a_proc = None
-        if not p:
-            return
-        try:
-            p.terminate()
-            try:
-                p.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                p.kill()
-        except Exception:
-            pass
-        self._log("teleagent2api 已停止")
-
-    def _wait_health(self, port, seconds):
-        url = "http://127.0.0.1:%d/health" % port
-        deadline = time.time() + seconds
-        while time.time() < deadline:
-            if self.t2a_proc and self.t2a_proc.poll() is not None:
-                self._log("teleagent2api 进程已退出（返回码 %s）" % self.t2a_proc.returncode)
-                return False
-            try:
-                with urllib.request.urlopen(url, timeout=2) as r:
-                    if r.status == 200:
-                        return True
-            except Exception:
-                pass
-            time.sleep(0.4)
-        return False
-
-    @staticmethod
-    def _tail(path, n):
-        try:
-            with open(path, "rb") as f:
-                lines = f.read().decode("utf-8", "replace").splitlines()
-            return lines[-n:]
-        except OSError:
-            return []
-
-    @staticmethod
-    def _port_open(port):
-        try:
-            s = socket.create_connection(("127.0.0.1", int(port)), timeout=0.5)
-            s.close()
-            return True
-        except OSError:
-            return False
-
-    def _open_console(self):
-        if self._mode() == "teleagent2api":
-            port = self._int(self.vars["t2a_port"].get(), 10000)
-            url = "http://127.0.0.1:%d/ui" % port
-        else:
-            url = self.vars["gateway_url"].get().strip().rstrip("/") or "http://127.0.0.1:8899"
-        webbrowser.open(url)
-        self._log("已在浏览器打开 %s" % url)
 
     def _start_agent(self, cfg):
         self.agent = pool_agent.Agent({
@@ -561,7 +358,6 @@ class App:
             self.gateway_mod = None
             threading.Thread(target=mod.stop_gateway, args=(srv,), daemon=True).start()
             self._log("本地网关已停止")
-        self._stop_t2a()
         self.running = False
         self._set_controls(True)
         self._set_status("已停止", "#8a8a8a")
@@ -589,12 +385,10 @@ class App:
         state = "normal" if enabled else "disabled"
         for k in TEXT_ROWS:
             self.vars["#" + k].configure(state=state)
-        self.cmb_mode.configure(state="readonly" if enabled else "disabled")
         self.chk_auto.configure(state=state)
         self.chk_insecure.configure(state=state)
         self.btn_save.configure(state=state)
         self.btn_start.configure(state=state)
-        self.btn_console.configure(state=state)
         self.btn_stop.configure(state="disabled" if enabled else "normal")
 
     def _log(self, msg):
@@ -631,32 +425,21 @@ class App:
             return
 
         def work():
-            base = cfg["gateway_url"].rstrip("/")
+            url = cfg["gateway_url"].rstrip("/") + "/pool/status"
             headers = {}
             if cfg["gateway_key"]:
                 headers["Authorization"] = "Bearer " + cfg["gateway_key"]
-            # teleagent2api 没有 /pool/status，直连网关才有；标准网关用 /v1/models
-            paths = (("/v1/models",) if cfg["upstream_mode"] == "teleagent2api"
-                     else ("/pool/status", "/v1/models"))
-            for path in paths:
-                url = base + path
-                req = urllib.request.Request(url, headers=headers)
-                t0 = time.time()
-                try:
-                    with urllib.request.urlopen(req, timeout=5) as r:
-                        body = r.read(300).decode("utf-8", "replace")
-                    self._log("测试网关 %s → HTTP %s（%.0f ms）"
-                              % (url, r.status, (time.time() - t0) * 1000))
-                    self._log("返回：%s" % body)
-                    return
-                except urllib.error.HTTPError as e:
-                    if e.code in (301, 302, 404) and path != paths[-1]:
-                        continue
-                    self._log("测试网关 %s → HTTP %s（检查网关 API Key 是否一致）" % (url, e.code))
-                    return
-                except Exception as e:
-                    self._log("测试网关失败：%s" % e)
-                    return
+            req = urllib.request.Request(url, headers=headers)
+            t0 = time.time()
+            try:
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    body = r.read(300).decode("utf-8", "replace")
+                self._log("测试网关 %s → HTTP %s（%.0f ms）" % (url, r.status, (time.time() - t0) * 1000))
+                self._log("返回：%s" % body)
+            except urllib.error.HTTPError as e:
+                self._log("测试网关 %s → HTTP %s（检查网关 API Key 是否一致）" % (url, e.code))
+            except Exception as e:
+                self._log("测试网关失败：%s" % e)
 
         threading.Thread(target=work, daemon=True).start()
 
