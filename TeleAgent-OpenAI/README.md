@@ -270,7 +270,7 @@ v2.4 改成和 `teleagent-openai-proxy` 同一套异步架构：
 | 取流 | 订阅 4397 的 `GET /global/event`（SSE），逐条读事件；没有该端点时回退 `/event` |
 | 结束 | 收到 `session.status` 的 `idle` 才收尾；`message.updated` 的 `time.completed` 只作 3 秒宽限（工具调用后还有后续消息，不能立刻结束） |
 | 推理/正文 | 按 part 类型区分：`text` 才进 `delta.content`，`reasoning` 进 `delta.reasoning_content`，工具/步骤类 part 的增量直接丢弃 |
-| 原生工具 | `prompt_async` / `message` 都带 `tools: {..., false}`，关掉上游 agent 自带的 read/bash/edit 等原生工具，工具调用只能以 JSON 文本返回、再由网关转成 OpenAI `tool_calls` |
+| 原生工具 | `prompt_async` / `message` 带 `tools: {..., false}`；同时在会话目录写 `opencode.json` 把 `tools` 全关（这个版本的 4397 不认请求里的 `tools`，必须走项目配置，改完要重启 TeleAgent 客户端） |
 | 保活 | 8 秒没有事件就发一个零宽空格 `content` 帧，保证客户端侧「有活动」 |
 | 兜底 | 150 秒无任何事件、或总时长超 1800 秒，主动收尾，避免无限挂起 |
 

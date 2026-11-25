@@ -455,6 +455,10 @@ def parse_tool_calls(text):
     if s.startswith("```"):
         s = re.sub(r"^```[A-Za-z0-9_-]*\s*", "", s)
         s = re.sub(r"\s*```$", "", s)
+    # 上游会把正文切碎，偶尔把开头的 {" 丢掉，留下 tool_calls":[...
+    # 补回缺的花括号和引号再解析，否则整段 JSON 会被当正文显示给用户
+    if s.startswith('tool_calls"') or s.startswith("tool_calls'"):
+        s = '{"' + s
     dec = json.JSONDecoder()
     idx = 0
     while True:
@@ -907,6 +911,9 @@ class Handler(BaseHTTPRequestHandler):
                     mid = part.get("messageID") or pr.get("messageID")
                     if not msg_ids or mid in msg_ids:
                         text_pids.add(pid)
+                elif ptype in ("tool", "tool-call", "tool-invocation"):
+                    log("%s 上游仍在执行原生工具 %s（opencode.json 未生效，需要重启 TeleAgent 客户端）"
+                        % (model, part.get("name") or part.get("tool") or "?"))
                 elif ptype == "step-finish":
                     tk = part.get("tokens") or {}
                     if tk and not usage:
@@ -997,11 +1004,42 @@ class Handler(BaseHTTPRequestHandler):
             el, "" if got_any else " [无内容]"))
 
 
+def ensure_upstream_no_tools():
+    """在会话目录写 opencode.json，关掉上游 agent 自己的工具。
+
+    4397 是完整的 opencode agent，prompt 里的 tools 开关不被这个版本接受，
+    模型会自己 read/bash/edit，把成果写进会话临时目录，客户端只能看到
+    「说到一半就结束」。opencode 按会话所在目录读项目级配置，所以把
+    tools 全关掉写在 SESSION_DIR 里最稳。改完需要重启 TeleAgent 客户端生效。
+    """
+    cfg = {
+        "$schema": "https://opencode.ai/config.json",
+        "tools": upstream_tools_off(),
+    }
+    try:
+        os.makedirs(SESSION_DIR, exist_ok=True)
+        p = os.path.join(SESSION_DIR, "opencode.json")
+        data = json.dumps(cfg, ensure_ascii=False, indent=2) + "\n"
+        old = None
+        try:
+            with open(p, encoding="utf-8") as f:
+                old = f.read()
+        except Exception:
+            pass
+        if old != data:
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(data)
+            log("已写入 %s：关闭上游原生工具（重启 TeleAgent 客户端后生效）" % p)
+    except Exception as e:
+        log("写入 opencode.json 失败: %s" % e)
+
+
 def create_gateway(host="127.0.0.1", port=8899, prewarm=True):
     """创建网关 HTTP 服务并启动探活线程；调用方负责 serve_forever。
 
     图形界面（node_gui.py）用它把网关内嵌到同一个进程里。
     """
+    ensure_upstream_no_tools()
     if prewarm:
         try:
             get_client()
