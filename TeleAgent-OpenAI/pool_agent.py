@@ -231,18 +231,48 @@ class Agent:
     def _auth_headers(self):
         return {"Authorization": "Bearer " + self.gateway_key} if self.gateway_key else {}
 
-    def fetch_status(self):
-        conn, base = self._gateway_conn(timeout=5)
+    def _get_json(self, path, timeout=5):
+        conn, base = self._gateway_conn(timeout=timeout)
         try:
-            conn.request("GET", base + "/pool/status", headers=self._auth_headers())
+            conn.request("GET", base + path, headers=self._auth_headers())
             resp = conn.getresponse()
             data = resp.read()
-            return resp.status, json.loads(data.decode("utf-8", "replace"))
+            try:
+                obj = json.loads(data.decode("utf-8", "replace"))
+            except Exception:
+                obj = None
+            return resp.status, obj
         finally:
             try:
                 conn.close()
             except Exception:
                 pass
+
+    def fetch_status(self):
+        st, obj = self._get_json("/pool/status")
+        if st == 200 and isinstance(obj, dict) and ("upstream" in obj or "models" in obj):
+            return st, obj
+        # 标准 OpenAI 网关（例如 teleagent2api）没有 /pool/status：
+        # 它会把未知路径 302 到 /ui，或直接 404。这两种都退回 /v1/models
+        # 探活，并伪造同形状的状态给面板。
+        t0 = time.time()
+        st2, obj2 = self._get_json("/v1/models")
+        ms = int((time.time() - t0) * 1000)
+        models = DEFAULT_MODELS
+        if st2 == 200 and isinstance(obj2, dict):
+            got = [m.get("id") for m in (obj2.get("data") or [])
+                   if isinstance(m, dict) and m.get("id")]
+            if got:
+                models = got
+            up = {"ok": True, "latency_ms": ms, "key_set": bool(self.gateway_key),
+                  "state": "ok", "error": ""}
+        else:
+            up = {"ok": False, "latency_ms": ms, "key_set": bool(self.gateway_key),
+                  "state": "error", "error": "models HTTP %s" % st2}
+        with self.lock:
+            inflight = len(self.inflight)
+        return 200, {"ok": True, "models": models, "upstream": up,
+                     "inflight": inflight, "totals": {}}
 
     # ---------- 连接 ----------
     def run(self):

@@ -761,36 +761,53 @@ start-pool-agent.bat
 ## 十三、Windows 节点一键 exe（图形界面）
 
 不想装 Python、也不想敲命令时，用 `node_gui.py` 打包成单个 exe：双击打开窗口，
-填好面板地址和节点凭据，点「启动」即同时运行本地网关和池代理。
+填好面板地址和节点凭据，点「启动」即自动拉起上游网关和池代理。
+
+窗口里「上游方式」下拉切换两种上游：
+
+| 方式 | 说明 |
+|---|---|
+| **teleagent2api（默认，推荐）** | 同目录放 `teleagent2api.exe`，由窗口自动拉起。Go 单跳直连 TeleAgent 平台 API，不依赖 4397 客户端；流式按帧转发，不会出现「思考到一半停住」。 |
+| 内置网关 | 运行 `teleagent_gateway`，需要本机 TeleAgent 客户端已登录、4397 在监听。 |
 
 ### 打包（在开发机上做一次）
 
 双击 `build-exe.bat`，产物为 `dist\TeleAgentNode.exe`（自带 Python 与 tkinter，目标机无需安装 Python）。
-
-脚本会检查/安装 PyInstaller，然后执行等价于：
+再把上游 exe 拷到同目录一起分发：
 
 ```bat
-pyinstaller --onefile --noconsole --hidden-import teleagent_gateway node_gui.py
+copy ..\teleagent2api-main\teleagent2api.exe dist\
 ```
 
-### 在节点机上使用
+发布时这两个 exe 必须放在**同一个目录**。`teleagent2api` 是独立开源项目，源码可自行
+`go build -trimpath -ldflags "-s -w" -o teleagent2api.exe .` 编译，或用作者提供的发行版。
 
-1. 确保 TeleAgent 客户端已登录并运行（4397 端口在监听）。
-2. 双击 `TeleAgentNode.exe`。
-3. 填写：
-   - **服务器地址**：`wss://面板域名/api/pool/agent`
-   - **节点 ID / 节点 Token**：面板「网关池」创建节点时给的一次性值
-   - **网关 API Key**：与网关的 `TG_API_KEY` 一致（本机网关鉴权用，可留空）
-4. 勾选「自动启动本地网关」（默认），点「启动」。
-5. 日志出现 `已连接 wss://...`、状态变绿即接入成功，面板「网关池」里该节点显示在线。
+### 在节点机上使用（teleagent2api 方式）
 
-配置自动保存在 exe 同目录的 `pool-agent.json`；该目录不可写时回退到
-`%APPDATA%\TeleAgentNode\pool-agent.json`。「测试网关」按钮会请求本机 `/pool/status`
-检查 API Key 是否正确。
+1. `TeleAgentNode.exe` 与 `teleagent2api.exe` 放同一目录，双击前者。
+2. 填写：**服务器地址**（`wss://面板域名/api/pool/agent`）、**节点 ID / 节点 Token**（面板「网关池」创建节点时给的一次性值）、
+   **网关端口**（默认 10000）、**控制台密码**（留空会自动生成并在日志里打印）。
+3. 点「打开上游控制台」打开 `http://127.0.0.1:10000/ui`，用控制台密码登录，在「账号」页添加账号：
+   - 「网页登录续期」：浏览器登录一次 TeleAgent，token 自动兑换保存；
+   - 或运行 teleagent2api 自带的 `tools/get-teleagent-token.ps1`（需 PowerShell 7+）取出
+     token / deviceId / installId 后粘贴。
+4. 回窗口点「启动」。日志依次出现 `teleagent2api 就绪`、`已连接 wss://...` 即接入成功，
+   面板「网关池」里该节点显示在线。
+5. 「测试网关」按钮会请求本机 `/v1/models` 校验网关密钥。
+
+自动生成并保存在 exe 同目录的文件：
+
+| 文件 | 内容 |
+|---|---|
+| `pool-agent.json` | 窗口里的全部配置（目录不可写时回退 `%APPDATA%\TeleAgentNode\`） |
+| `teleagent2api-config.json` | 上游网关配置：`timeout 1800s`、`reasoningMode reasoning_content`、`apiKey` |
+| `teleagent2api.log` | 上游网关运行日志，启动失败时窗口会打印日志末尾 |
 
 ### 说明
 
-- exe 只包含本项目的 Python 代码，**仍需本机安装并登录 TeleAgent 客户端**，它才是真正调用模型的通道。
-- 不勾选「自动启动本地网关」时，程序只跑池代理，连接「网关地址」里已有的网关。
+- **网关 API Key 留空会自动生成**（`sk-t2a-...`）并写入配置，不需要手工比对。
+- 端口已有服务在监听时（例如你已手工开着 teleagent2api）会直接复用，不再重复启动。
+- 点「停止」会把窗口自动拉起的 teleagent2api 一并关掉；手工开的不受影响。
+- 用「内置网关」方式时：勾选「自动启动本地网关」，网关地址填 `http://127.0.0.1:8899`，其余同上。
 - 一个 exe 对应一个节点；多台机器各放一份，节点 ID 不要重复。
 - 开机自启：把 exe 的快捷方式放进启动文件夹，或在任务计划程序里设置「登录时」运行。
