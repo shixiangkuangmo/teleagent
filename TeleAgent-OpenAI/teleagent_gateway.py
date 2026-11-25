@@ -387,6 +387,20 @@ def messages_to_text(messages):
 # 4397 通道只能发纯文本，没有原生 function calling。这里用一段 JSON 协议桥接：
 # 需要调用工具时，模型只输出 {"tool_calls":[{"name":...,"arguments":{...}}]}，
 # 网关解析后转成标准 OpenAI tool_calls。模型不按协议输出时按普通文本返回（安全降级）。
+def upstream_tools_off():
+    """关掉 opencode 上游自带的原生工具。
+
+    4397 本身是个 agent，模型能看到 read/bash/edit 等原生工具定义。不关的话
+    它会自己「读文件、跑命令」，工具调用不经过 OpenAI tool_calls，Trae 只能
+    看到说到一半就没下文。opencode 的 prompt 接口支持 tools 开关，未知名字
+    会被忽略，传 false 是安全的。
+    """
+    names = ("bash", "edit", "write", "read", "glob", "grep", "list", "patch",
+             "task", "todowrite", "todoread", "webfetch", "websearch", "lsp",
+             "multiedit", "skill")
+    return {n: False for n in names}
+
+
 def build_tool_prompt(tools, tool_choice):
     if tool_choice == "none":
         return ""
@@ -426,6 +440,8 @@ def build_tool_prompt(tools, tool_choice):
         "不要输出解释、Markdown 或代码围栏：\n"
         '{"tool_calls":[{"name":"工具名","arguments":{"参数名":值}}]}\n'
         "arguments 必须符合对应工具的 JSON Schema。不需要调用工具时，正常回答用户。\n"
+        "你没有内置工具，不要尝试自己读取文件、执行命令或调用任何原生工具；"
+        "所有工具调用只能走上面的 JSON 协议。\n"
         + force +
         "工具列表（JSON）：\n" + json.dumps(specs, ensure_ascii=False)
     )
@@ -636,6 +652,7 @@ class Handler(BaseHTTPRequestHandler):
         st, raw = call_with_retry("POST", "/session/%s/message" % sid, {
             "parts": [{"type": "text", "text": text}],
             "model": {"providerID": "NewApi", "modelID": model},
+            "tools": upstream_tools_off(),
         })
         el = time.time() - t_req
         if st != 200:
@@ -779,6 +796,8 @@ class Handler(BaseHTTPRequestHandler):
                 "parts": [{"type": "text", "text": text}],
                 "directory": SESSION_DIR,
                 "model": {"providerID": "NewApi", "modelID": model},
+                # 关键：关掉上游原生工具，工具调用只能走网关的 JSON 协议返回给客户端
+                "tools": upstream_tools_off(),
             }, timeout=15)
         except Exception as e:
             st, raw = None, str(e).encode()
@@ -794,6 +813,7 @@ class Handler(BaseHTTPRequestHandler):
         text_pids = set()
         msg_ids = set()
         part_types = {}
+        pending = {}
         ev_count = {}
         content_acc = []
         usage = {}
@@ -805,6 +825,8 @@ class Handler(BaseHTTPRequestHandler):
         last_ev = time.time()
 
         while True:
+            if dead.is_set():
+                break
             try:
                 ev = q.get(timeout=0.3)
             except queue.Empty:
@@ -812,6 +834,15 @@ class Handler(BaseHTTPRequestHandler):
 
             if ev is None:
                 now = time.time()
+                # 缓存超过 1 秒还没等到 part.updated：类型未知，按正文放出，
+                # 宁可混一点也不丢字（正文缺开头会让 tool_calls JSON 解析失败）
+                if pending:
+                    for p, ent in list(pending.items()):
+                        if now - ent[0] >= 1.0:
+                            del pending[p]
+                            for dly in ent[1]:
+                                content_acc.append(dly)
+                                chunk({"content": dly})
                 # Trae 的 stream_idle_timeout 只认 data: 帧，SSE 注释行算静默，
                 # 所以用零宽空格 content 做心跳：客户端视为有进度，正文不可见。
                 if now - last_beat >= 8.0:
@@ -863,6 +894,15 @@ class Handler(BaseHTTPRequestHandler):
                 pid = part.get("id")
                 if pid:
                     part_types[pid] = ptype
+                    ent = pending.pop(pid, None)
+                    if ent and ptype not in ("tool", "tool-call", "tool-invocation",
+                                             "patch", "snapshot"):
+                        for dly in ent[1]:
+                            if ptype == "text":
+                                content_acc.append(dly)
+                                chunk({"content": dly})
+                            else:
+                                chunk({"reasoning_content": dly})
                 if ptype == "text" and pid:
                     mid = part.get("messageID") or pr.get("messageID")
                     if not msg_ids or mid in msg_ids:
@@ -887,10 +927,19 @@ class Handler(BaseHTTPRequestHandler):
                     log("%s 首字 %.1fs" % (model, first_token_at[0]))
                 last_beat = last_ev
                 completed_at[0] = 0.0
-                # 正文 = part 类型为 text，或未知 part 且 field 明确标了 text。
-                # reasoning/thinking part 一律走 reasoning_content，不能当正文，
-                # 否则客户端会把模型内心独白渲染成回复。
-                if ptype == "text" or (not ptype and pr.get("field") == "text"):
+                if not ptype and pid:
+                    # part.updated 可能晚于第一批 delta：先按 part 缓存，
+                    # 等类型确定了再归到 content / reasoning_content，
+                    # 否则开头几个字符会被错判丢弃（tool_calls JSON 就解析不出来）
+                    ent = pending.get(pid)
+                    if ent is None:
+                        pending[pid] = [time.time(), [d]]
+                    else:
+                        ent[1].append(d)
+                    continue
+                # 正文 = part 类型为 text；reasoning/thinking 一律走 reasoning_content，
+                # 不能当正文，否则客户端会把模型内心独白渲染成回复。
+                if ptype == "text" or (not pid and pr.get("field") == "text"):
                     content_acc.append(d)
                     if not chunk({"content": d}):
                         break
@@ -907,6 +956,11 @@ class Handler(BaseHTTPRequestHandler):
                                             json.dumps(pr, ensure_ascii=False)[:300]))
 
         stop.set()
+        # 收尾：还没等到类型判定的增量按正文补发，避免丢字
+        for ent in pending.values():
+            for dly in ent[1]:
+                content_acc.append(dly)
+                chunk({"content": dly})
         el = time.time() - t_req
 
         if ev_count:
