@@ -15,6 +15,7 @@ import json
 import os
 import queue
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -28,12 +29,21 @@ import tkinter as tk
 from tkinter import messagebox, scrolledtext, ttk
 
 import pool_agent
+import teleagent_cred
 
 APP_NAME = "TeleAgent 节点"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.2.0"
 CONFIG_NAME = "pool-agent.json"
 TEXT_ROWS = ("server", "node_id", "token", "name", "max_inflight",
              "gateway_url", "gateway_key", "max_prompt")
+
+# 上游方式：tg2api = 直连平台 chat 接口（无 agent、无原生工具，推荐）
+#           embedded = 本机 4397 opencode 网关（会自己跑工具，不推荐）
+UPSTREAM_LABELS = {
+    "tg2api": "teleagent2api（直连平台，推荐）",
+    "embedded": "内置网关（4397，agent 模式）",
+}
+LABEL_TO_UPSTREAM = {v: k for k, v in UPSTREAM_LABELS.items()}
 
 
 def app_dir():
@@ -68,6 +78,7 @@ def default_config():
         "max_inflight": 4,
         "gateway_url": "http://127.0.0.1:8899",
         "gateway_key": "",
+        "upstream": "tg2api",
         "auto_gateway": True,
         "max_prompt": 40000,
         "insecure": False,
@@ -111,6 +122,8 @@ class App:
         self.agent = None
         self.gateway_srv = None
         self.gateway_mod = None
+        self.upstream_proc = None
+        self.upstream_token = ""
         self.running = False
         self.vars = {}
 
@@ -147,13 +160,23 @@ class App:
         box2.pack(fill="x", pady=(10, 0))
         box2.columnconfigure(1, weight=1)
 
-        self._row(box2, 0, "网关地址", "gateway_url", "http://127.0.0.1:8899")
-        self._row(box2, 1, "网关 API Key", "gateway_key",
+        ttk.Label(box2, text="上游方式").grid(row=0, column=0, sticky="e", padx=(0, 8), pady=3)
+        up = self.cfg.get("upstream") or "tg2api"
+        self.vars["upstream"] = tk.StringVar(value=UPSTREAM_LABELS.get(up, up))
+        self.cmb_upstream = ttk.Combobox(box2, textvariable=self.vars["upstream"],
+                                         state="readonly",
+                                         values=list(UPSTREAM_LABELS.values()))
+        self.cmb_upstream.grid(row=0, column=1, sticky="ew", pady=3)
+        ttk.Label(box2, text="直连平台：网关地址/Key 由程序自动写入",
+                  foreground="#888").grid(row=0, column=2, sticky="w", padx=(8, 0), pady=3)
+
+        self._row(box2, 1, "网关地址", "gateway_url", "http://127.0.0.1:8899")
+        self._row(box2, 2, "网关 API Key", "gateway_key",
                   "即 TG_API_KEY；面板转发到本机网关时使用，可留空", show="*")
-        self._row(box2, 2, "Prompt 上限", "max_prompt", "字符数，默认 40000")
+        self._row(box2, 3, "Prompt 上限", "max_prompt", "字符数，默认 40000")
 
         opts = ttk.Frame(box2)
-        opts.grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        opts.grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
         self.vars["auto_gateway"] = tk.BooleanVar(value=bool(self.cfg.get("auto_gateway", True)))
         self.chk_auto = ttk.Checkbutton(opts, text="自动启动本地网关（TeleAgent 客户端需已运行）",
                                         variable=self.vars["auto_gateway"])
@@ -229,6 +252,7 @@ class App:
             "max_inflight": num("max_inflight", 4, 1, 64),
             "gateway_url": txt("gateway_url") or "http://127.0.0.1:8899",
             "gateway_key": txt("gateway_key"),
+            "upstream": LABEL_TO_UPSTREAM.get(txt("upstream"), "tg2api"),
             "auto_gateway": bool(self.vars["auto_gateway"].get()),
             "max_prompt": num("max_prompt", 40000, 1000, 5000000),
             "insecure": bool(self.vars["insecure"].get()),
@@ -239,7 +263,7 @@ class App:
             raise ValueError("请填写：%s" % "、".join(missing))
         if not cfg["server"].startswith(("ws://", "wss://")):
             raise ValueError("服务器地址必须以 ws:// 或 wss:// 开头")
-        if not cfg["gateway_url"].startswith(("http://", "https://")):
+        if cfg["upstream"] != "tg2api" and not cfg["gateway_url"].startswith(("http://", "https://")):
             raise ValueError("网关地址必须以 http:// 或 https:// 开头")
         return cfg
 
@@ -278,13 +302,18 @@ class App:
             self._log("保存配置失败（不影响本次运行）：%s" % e)
         self.cfg = cfg
 
-        if cfg["auto_gateway"]:
+        if cfg["upstream"] == "tg2api":
+            if not self._start_upstream(cfg):
+                return
+        elif cfg["auto_gateway"]:
             if not self._start_gateway(cfg):
                 return
         self._start_agent(cfg)
         self.running = True
         self._set_controls(False)
         self._set_status("启动中…", "#b58900")
+        if cfg["upstream"] == "tg2api":
+            threading.Thread(target=self._cred_loop, daemon=True).start()
 
     def _start_gateway(self, cfg):
         u = urllib.parse.urlsplit(cfg["gateway_url"])
@@ -316,6 +345,120 @@ class App:
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         self._log("本地网关已启动：http://127.0.0.1:%d/v1" % port)
         return True
+
+    def _start_upstream(self, cfg):
+        """启动 teleagent2api，并用自动提取的账号凭证播种账号池。"""
+        exe = os.path.join(app_dir(), "teleagent2api.exe")
+        if not os.path.exists(exe):
+            messagebox.showerror(APP_NAME, "缺少 teleagent2api.exe，请与节点 exe 放在同一目录。")
+            return False
+        try:
+            cred = teleagent_cred.extract()
+        except Exception as e:
+            messagebox.showerror(
+                APP_NAME, "自动提取 TeleAgent 账号失败：%s\n\n"
+                "请确认桌面客户端已登录过（凭证保存在 %%USERPROFILE%%\\.local\\share\\TeleAgent）。" % e)
+            return False
+        exp = cred.get("exp") or 0
+        self._log("已自动提取账号凭证：deviceId=%s token 剩余 %s" % (
+            (cred["device_id"] or "未知")[:8],
+            ("%.1f 天" % ((exp - time.time()) / 86400)) if exp else "未知"))
+
+        data_dir = os.path.join(os.environ.get("LOCALAPPDATA") or app_dir(),
+                                "TeleAgentNode", "tg2api")
+        os.makedirs(data_dir, exist_ok=True)
+        acct_file = os.path.join(data_dir, "teleagent-accounts.json")
+        state_file = os.path.join(data_dir, "teleagent-token-state.json")
+        for p in (acct_file, state_file):
+            try:
+                # 每次启动都重新播种，保证用的是最新 token；
+                # state 文件优先级高于环境变量，留着会盖掉新 token
+                if os.path.exists(p):
+                    os.remove(p)
+            except OSError:
+                pass
+
+        api_key = cfg["gateway_key"] or "sk-node-local"
+        env = dict(os.environ)
+        env.update({
+            "TELEAGENT_TOKEN": cred["token"],
+            "TELEAGENT_DEVICE_ID": cred["device_id"],
+            "TELEAGENT_INSTALL_ID": cred["install_id"],
+            "TELEAGENT2API_LISTEN": "127.0.0.1:10000",
+            "TELEAGENT_TIMEOUT": "1800s",
+            "TELEAGENT_REASONING_MODE": "reasoning_content",
+            "TELEAGENT_ACCOUNTS_FILE": acct_file,
+            "TELEAGENT_KEYS_FILE": os.path.join(data_dir, "teleagent-keys.json"),
+            "TELEAGENT_STATE_FILE": state_file,
+            "ADMIN_PASSWORD": os.urandom(9).hex(),
+            "API_KEY": api_key,
+            "TELEAGENT_LOG_LEVEL": "info",
+            "TELEAGENT_LOG_FORMAT": "text",
+        })
+        flags = 0x08000000 if os.name == "nt" else 0   # CREATE_NO_WINDOW
+        try:
+            self.upstream_proc = subprocess.Popen(
+                [exe], cwd=app_dir(), env=env,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=flags)
+        except OSError as e:
+            messagebox.showerror(APP_NAME, "启动 teleagent2api 失败：%s" % e)
+            return False
+
+        ok = False
+        for _ in range(60):
+            if self.upstream_proc.poll() is not None:
+                break
+            try:
+                with urllib.request.urlopen("http://127.0.0.1:10000/health", timeout=1) as r:
+                    if r.status == 200:
+                        ok = True
+                        break
+            except Exception:
+                time.sleep(0.2)
+        if not ok:
+            code = self.upstream_proc.poll()
+            self._stop_upstream()
+            messagebox.showerror(
+                APP_NAME, "teleagent2api 启动失败（退出码 %s）。\n"
+                "常见原因：10000 端口被占用，或 token 已失效。" % code)
+            return False
+
+        self.upstream_token = cred["token"]
+        self._log("teleagent2api 已就绪：http://127.0.0.1:10000/v1（账号已自动配置）")
+        cfg["gateway_url"] = "http://127.0.0.1:10000"
+        cfg["gateway_key"] = api_key
+        return True
+
+    def _stop_upstream(self):
+        proc, self.upstream_proc = self.upstream_proc, None
+        if not proc:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        self._log("teleagent2api 已停止")
+
+    def _cred_loop(self):
+        """每 30 分钟重读一次凭证，token 变了就重启上游（JWT 会过期）。"""
+        while self.running:
+            time.sleep(1800)
+            if not self.running:
+                return
+            try:
+                cred = teleagent_cred.extract()
+            except Exception:
+                continue
+            if cred["token"] and cred["token"] != self.upstream_token:
+                self._log("检测到账号 token 已更新，重启 teleagent2api…")
+                self._stop_upstream()
+                cfg = dict(self.cfg)
+                self._start_upstream(cfg)
 
     def _start_agent(self, cfg):
         self.agent = pool_agent.Agent({
@@ -358,6 +501,7 @@ class App:
             self.gateway_mod = None
             threading.Thread(target=mod.stop_gateway, args=(srv,), daemon=True).start()
             self._log("本地网关已停止")
+        self._stop_upstream()
         self.running = False
         self._set_controls(True)
         self._set_status("已停止", "#8a8a8a")
@@ -387,6 +531,7 @@ class App:
             self.vars["#" + k].configure(state=state)
         self.chk_auto.configure(state=state)
         self.chk_insecure.configure(state=state)
+        self.cmb_upstream.configure(state="readonly" if enabled else "disabled")
         self.btn_save.configure(state=state)
         self.btn_start.configure(state=state)
         self.btn_stop.configure(state="disabled" if enabled else "normal")
