@@ -268,9 +268,8 @@ v2.4 改成和 `teleagent-openai-proxy` 同一套异步架构：
 |---|---|
 | 提交 | `POST /session/{sid}/prompt_async`，上游立刻返回 204，不再有长挂起的 HTTP 请求 |
 | 取流 | 订阅 4397 的 `GET /global/event`（SSE），逐条读事件；没有该端点时回退 `/event` |
-| 正文 | `message.part.delta` 中 `field == "text"`（或 part 已登记为 text）→ 实时 `delta.content` |
-| 推理 | 其余增量 → `delta.reasoning_content` |
-| 结束 | 收到 `session.status` 的 `idle`（或 `message.updated` 带 `time.completed`）即收尾 |
+| 结束 | 收到 `session.status` 的 `idle` 才收尾；`message.updated` 的 `time.completed` 只作 3 秒宽限（工具调用后还有后续消息，不能立刻结束） |
+| 推理/正文 | 按 part 类型区分：`text` 才进 `delta.content`，`reasoning` 进 `delta.reasoning_content`，工具/步骤类 part 的增量直接丢弃 |
 | 保活 | 8 秒没有事件就发一个零宽空格 `content` 帧，保证客户端侧「有活动」 |
 | 兜底 | 150 秒无任何事件、或总时长超 1800 秒，主动收尾，避免无限挂起 |
 

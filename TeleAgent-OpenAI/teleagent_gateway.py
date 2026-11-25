@@ -793,11 +793,14 @@ class Handler(BaseHTTPRequestHandler):
 
         text_pids = set()
         msg_ids = set()
+        part_types = {}
+        ev_count = {}
         content_acc = []
         usage = {}
         got_any = False
         error_msg = ""
         first_token_at = [None]
+        completed_at = [0.0]
         last_beat = time.time()
         last_ev = time.time()
 
@@ -815,6 +818,10 @@ class Handler(BaseHTTPRequestHandler):
                     if not chunk({"content": "\u200b"}):
                         break
                     last_beat = now
+                # 单条 assistant 消息完成 ≠ 整轮结束：模型可能刚发起工具调用，
+                # 后面还有工具结果 + 新消息。给 3 秒宽限，期间有新事件就继续。
+                if completed_at[0] and now - completed_at[0] > 3.0:
+                    break
                 if now - t_req > 1800:
                     error_msg = "总超时"
                     log("%s 流式总超时" % model)
@@ -830,7 +837,8 @@ class Handler(BaseHTTPRequestHandler):
                 break
 
             last_ev = time.time()
-            et = ev.get("type")
+            et = ev.get("type") or "?"
+            ev_count[et] = ev_count.get(et, 0) + 1
             pr = ev.get("properties") or {}
             ssid = pr.get("sessionID")
             if ssid and ssid != sid:
@@ -847,14 +855,18 @@ class Handler(BaseHTTPRequestHandler):
                     if info.get("error") or info.get("finish") == "error":
                         error_msg = "上游返回错误"
                     if (info.get("time") or {}).get("completed"):
-                        break
+                        # 不直接结束：工具调用后还会有后续消息
+                        completed_at[0] = time.time()
             elif et == "message.part.updated":
                 part = pr.get("part") or {}
-                ptype = part.get("type")
-                if ptype == "text" and part.get("id"):
+                ptype = part.get("type") or ""
+                pid = part.get("id")
+                if pid:
+                    part_types[pid] = ptype
+                if ptype == "text" and pid:
                     mid = part.get("messageID") or pr.get("messageID")
                     if not msg_ids or mid in msg_ids:
-                        text_pids.add(part["id"])
+                        text_pids.add(pid)
                 elif ptype == "step-finish":
                     tk = part.get("tokens") or {}
                     if tk and not usage:
@@ -866,13 +878,19 @@ class Handler(BaseHTTPRequestHandler):
                 d = pr.get("delta") or ""
                 if not d:
                     continue
+                ptype = part_types.get(pid, "")
+                if ptype in ("tool", "tool-call", "tool-invocation",
+                             "step-start", "step-finish", "patch", "snapshot"):
+                    continue
                 if first_token_at[0] is None:
                     first_token_at[0] = time.time() - t_req
                     log("%s 首字 %.1fs" % (model, first_token_at[0]))
                 last_beat = last_ev
-                # field == "text" 是正文增量；已登记为 text 的 part 也按正文。
-                # 正文必须实时发：只发 reasoning_content 时客户端判 idle 断流。
-                if pr.get("field") == "text" or pid in text_pids:
+                completed_at[0] = 0.0
+                # 正文 = part 类型为 text，或未知 part 且 field 明确标了 text。
+                # reasoning/thinking part 一律走 reasoning_content，不能当正文，
+                # 否则客户端会把模型内心独白渲染成回复。
+                if ptype == "text" or (not ptype and pr.get("field") == "text"):
                     content_acc.append(d)
                     if not chunk({"content": d}):
                         break
@@ -883,9 +901,22 @@ class Handler(BaseHTTPRequestHandler):
                 status = pr.get("status") or {}
                 if status.get("type") == "idle":
                     break
+            elif et == "session.error" or et.startswith("permission."):
+                # 上游工具审批等交互我们不参与，记下来便于排查
+                log("%s 上游事件 %s: %s" % (model, et,
+                                            json.dumps(pr, ensure_ascii=False)[:300]))
 
         stop.set()
         el = time.time() - t_req
+
+        if ev_count:
+            pts = {}
+            for t in part_types.values():
+                pts[t] = pts.get(t, 0) + 1
+            log("%s 事件统计: %s | part: %s" % (
+                model,
+                ",".join("%s=%d" % (k, v) for k, v in sorted(ev_count.items())),
+                ",".join("%s=%d" % (k, v) for k, v in sorted(pts.items())) or "无"))
 
         full = "".join(content_acc)
         calls = parse_tool_calls(full) if full else None
